@@ -56,4 +56,4 @@ finder = JobPageFinder(
 )
 ```
 
-只有页面存在没有文本语义但有可靠布局位置的交互元素时，当前视口截图才会附加到模型请求中。实现说明见 [`agent-docs/task/conditional-vision-fallback.md`](agent-docs/task/conditional-vision-fallback.md)。
+只有页面存在没有文本语义但有可靠布局位置的交互元素时，当前视口截图才会附加到模型请求中。实现说明见 [`agent-docs/tasks/JF-002-conditional-vision-fallback/spec.md`](agent-docs/tasks/JF-002-conditional-vision-fallback/spec.md)。
