@@ -1209,6 +1209,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "browser-use" },
+    { name = "pillow" },
     { name = "pydantic" },
     { name = "python-dotenv" },
 ]
@@ -1223,6 +1224,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "browser-use", editable = "../browser-use" },
+    { name = "pillow", specifier = ">=12,<13" },
     { name = "pydantic", specifier = ">=2.12,<3" },
     { name = "python-dotenv", specifier = ">=1.2,<2" },
 ]

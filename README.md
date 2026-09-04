@@ -46,3 +46,14 @@ asyncio.run(main())
 ```
 
 默认浏览器配置为无头模式，关闭截图、下载和默认扩展，并在所有退出路径终止浏览器进程。MVP 不处理登录、验证码、申请表单或搜索引擎查找官网。
+
+使用支持视觉的模型时，可以显式开启条件截图：
+
+```python
+finder = JobPageFinder(
+    llm=create_deepseek_llm(model="deepseek-v4-flash-vision-exp"),
+    use_vision=True,
+)
+```
+
+只有页面存在没有文本语义但有可靠布局位置的交互元素时，当前视口截图才会附加到模型请求中。实现说明见 [`agent-docs/task/conditional-vision-fallback.md`](agent-docs/task/conditional-vision-fallback.md)。

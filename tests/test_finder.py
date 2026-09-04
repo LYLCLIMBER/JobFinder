@@ -1,10 +1,13 @@
 import asyncio
+import base64
+import io
 from dataclasses import dataclass
 from typing import Any
 
 import pytest
 from browser_use.agent.views import ActionResult
 from browser_use.llm.views import ChatInvokeCompletion
+from PIL import Image
 
 from job_page_finder import JobPageFinder, JobPageFinderInput
 from job_page_finder.models import AgentDecision
@@ -27,6 +30,7 @@ class FakeState:
     dom_state: FakeDomState
     state_error: str | None = None
     page_info: Any = None
+    screenshot: str | None = None
 
 
 class FakeBrowser:
@@ -158,6 +162,57 @@ async def test_completes_when_home_page_contains_a_job() -> None:
     assert browser.navigated_to == "https://example.com/"
     assert browser.killed is True
     assert browser.screenshot_options == [False]
+
+
+@pytest.mark.asyncio
+async def test_sends_annotated_screenshot_when_textless_candidate_exists() -> None:
+    node = type(
+        "Node",
+        (),
+        {
+            "absolute_position": type("Rect", (), {"x": 20, "y": 20, "width": 100, "height": 50})(),
+            "is_visible": True,
+            "ax_node": None,
+            "children": [],
+            "get_meaningful_text_for_llm": lambda self: "",
+        },
+    )()
+    image = Image.new("RGB", (200, 100), "white")
+    output = io.BytesIO()
+    image.save(output, format="PNG")
+    screenshot = base64.b64encode(output.getvalue()).decode("ascii")
+    browser = FakeBrowser(
+        [
+            FakeState(
+                url="https://example.com/",
+                title="Example Company",
+                dom_state=FakeDomState("[18]<div />", {18: node}),
+                page_info=type(
+                    "PageInfo",
+                    (),
+                    {
+                        "viewport_width": 200,
+                        "viewport_height": 100,
+                        "scroll_x": 0,
+                        "scroll_y": 0,
+                        "pixels_above": 0,
+                        "pixels_below": 0,
+                    },
+                )(),
+                screenshot=screenshot,
+            )
+        ]
+    )
+    llm = FakeLlm([{"type": "scroll", "direction": "down"}])
+    finder, _ = make_finder(browser, llm, use_vision=True, max_consecutive_failures=1)
+
+    result = await finder.find(JobPageFinderInput(company_url="https://example.com", max_steps=1))
+
+    assert result.success is False
+    assert browser.screenshot_options == [True]
+    assert len(llm.calls) == 1
+    assert llm.calls[0][-1].content[1].text.startswith("Current browser screenshot")
+    assert llm.calls[0][-1].content[2].type == "image_url"
 
 
 @pytest.mark.asyncio
