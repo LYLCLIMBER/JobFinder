@@ -10,6 +10,9 @@ dependencies = [
     "python-dotenv>=1.2,<2",
 ]
 
+[project.scripts]
+jobfinder = "job_page_finder.cli:run"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

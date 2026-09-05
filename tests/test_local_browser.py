@@ -7,7 +7,7 @@ from browser_use import BrowserSession
 from browser_use.browser.profile import BrowserProfile
 from browser_use.llm.views import ChatInvokeCompletion
 
-from job_page_finder import JobPageFinder, JobPageFinderInput
+from job_page_finder import JobPageFinder, JobPageFinderInput, run_task
 from job_page_finder.models import AgentDecision
 
 
@@ -96,3 +96,51 @@ async def test_company_home_to_job_page_with_local_chromium() -> None:
     assert result.job_title == "Senior Backend Engineer"
     assert result.job_page_url == f"http://127.0.0.1:{port}/careers"
     assert result.steps == 2
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_unified_runner_company_home_to_job_page_with_local_chromium() -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), StaticSiteHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+
+    def create_browser() -> BrowserSession:
+        return BrowserSession(
+            browser_profile=BrowserProfile(
+                headless=True,
+                user_data_dir=None,
+                accept_downloads=False,
+                auto_download_pdfs=False,
+                highlight_elements=False,
+                dom_highlight_elements=False,
+                enable_default_extensions=False,
+                block_ip_addresses=False,
+            )
+        )
+
+    try:
+        result = await run_task(
+            {
+                "version": "v1",
+                "task_id": "local-chromium",
+                "type": "find_job_page",
+                "payload": {"company_url": f"http://127.0.0.1:{port}", "max_steps": 3},
+            },
+            llm=LocalSiteLlm(),
+            browser_factory=create_browser,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert result.status == "succeeded"
+    assert result.task_id == "local-chromium"
+    assert result.output is not None
+    assert result.output.job_title == "Senior Backend Engineer"
+    assert result.output.job_page_url == f"http://127.0.0.1:{port}/careers"
+    assert result.output.steps == 2
+    assert result.error is None
+    assert result.metadata.duration_ms >= 0

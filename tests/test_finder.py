@@ -41,12 +41,14 @@ class FakeBrowser:
         start_error: Exception | None = None,
         start_delay: float = 0,
         navigate_delay: float = 0,
+        kill_error: Exception | None = None,
     ) -> None:
         self.states = states
         self.position = 0
         self.start_error = start_error
         self.start_delay = start_delay
         self.navigate_delay = navigate_delay
+        self.kill_error = kill_error
         self.started = False
         self.killed = False
         self.navigated_to: str | None = None
@@ -70,6 +72,8 @@ class FakeBrowser:
 
     async def kill(self) -> None:
         self.killed = True
+        if self.kill_error:
+            raise self.kill_error
 
     def advance(self) -> None:
         self.position = min(self.position + 1, len(self.states) - 1)
@@ -209,6 +213,7 @@ async def test_sends_annotated_screenshot_when_textless_candidate_exists() -> No
     result = await finder.find(JobPageFinderInput(company_url="https://example.com", max_steps=1))
 
     assert result.success is False
+    assert result.error_code == "MAX_STEPS_REACHED"
     assert browser.screenshot_options == [True]
     assert len(llm.calls) == 1
     assert llm.calls[0][-1].content[1].text.startswith("Current browser screenshot")
@@ -257,6 +262,7 @@ async def test_fails_at_max_steps_when_no_specific_job_is_found() -> None:
     assert result.success is False
     assert result.steps == 2
     assert result.error == "Maximum steps reached without finding a specific job"
+    assert result.error_code == "MAX_STEPS_REACHED"
     assert len(llm.calls) == 2
     assert browser.killed is True
 
@@ -277,6 +283,7 @@ async def test_rejects_an_index_from_an_old_browser_state() -> None:
 
     assert result.success is False
     assert result.steps == 2
+    assert result.error_code == "ACTION_ERROR"
     assert "not available in the current browser state" in result.error
     assert tools.clicks == [7]
     assert browser.killed is True
@@ -294,6 +301,7 @@ async def test_kills_browser_when_startup_fails() -> None:
     assert result.success is False
     assert result.steps == 0
     assert result.error == "Browser initialization failed: cannot launch"
+    assert result.error_code == "BROWSER_INITIALIZATION_FAILED"
     assert browser.killed is True
 
 
@@ -309,6 +317,7 @@ async def test_enforces_step_timeout() -> None:
     assert result.success is False
     assert result.steps == 1
     assert result.error == "Step timed out after 0.01 seconds"
+    assert result.error_code == "STEP_TIMEOUT"
     assert browser.killed is True
 
 
@@ -329,4 +338,66 @@ async def test_enforces_browser_initialization_timeout(timeout_phase: str) -> No
     assert result.success is False
     assert result.steps == 0
     assert result.error == "Browser initialization timed out after 0.01 seconds"
+    assert result.error_code == "BROWSER_INITIALIZATION_TIMEOUT"
+    assert browser.killed is True
+
+
+@pytest.mark.asyncio
+async def test_classifies_model_errors_from_the_llm_path() -> None:
+    """Classify LLM exceptions as MODEL_ERROR even when the message matches another failure."""
+    browser = FakeBrowser([state("<h1>Careers</h1>")])
+    llm = FakeLlm([RuntimeError("Maximum steps reached without finding a specific job")])
+    finder, _ = make_finder(browser, llm, max_consecutive_failures=1)
+
+    result = await finder.find(JobPageFinderInput(company_url="https://example.com"))
+
+    assert result.success is False
+    assert result.error_code == "MODEL_ERROR"
+    assert result.error == "Action failed: Maximum steps reached without finding a specific job"
+    assert browser.killed is True
+
+
+@pytest.mark.asyncio
+async def test_classifies_validation_failures_from_done_rejection() -> None:
+    """Classify consecutive rejected done actions as VALIDATION_FAILED."""
+    browser = FakeBrowser([state("<div>Senior Backend Engineer</div>")])
+    llm = FakeLlm(
+        [
+            {"type": "done", "job_title": "Chief Astronaut", "evidence": "Chief Astronaut"},
+            {"type": "done", "job_title": "Chief Astronaut", "evidence": "Chief Astronaut"},
+        ]
+    )
+    finder, _ = make_finder(browser, llm, max_consecutive_failures=2)
+
+    result = await finder.find(JobPageFinderInput(company_url="https://example.com", max_steps=2))
+
+    assert result.success is False
+    assert result.error_code == "VALIDATION_FAILED"
+    assert "done rejected" in result.error
+    assert browser.killed is True
+
+
+@pytest.mark.asyncio
+async def test_cleanup_exception_does_not_override_result() -> None:
+    """Keep the original task result when browser cleanup fails."""
+    browser = FakeBrowser(
+        [state("<h1>Open roles</h1><div>Senior Backend Engineer</div>")],
+        kill_error=RuntimeError("kill failed"),
+    )
+    llm = FakeLlm(
+        [
+            {
+                "type": "done",
+                "job_title": "Senior Backend Engineer",
+                "evidence": "Senior Backend Engineer",
+            }
+        ]
+    )
+    finder, _ = make_finder(browser, llm)
+
+    result = await finder.find(JobPageFinderInput(company_url="https://example.com"))
+
+    assert result.success is True
+    assert result.job_title == "Senior Backend Engineer"
+    assert result.error is None
     assert browser.killed is True

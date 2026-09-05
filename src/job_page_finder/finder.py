@@ -1,5 +1,6 @@
 import asyncio
 import html
+import logging
 import re
 from collections.abc import Callable
 from typing import Any
@@ -13,12 +14,15 @@ from job_page_finder.models import (
     AgentDecision,
     ClickAction,
     DoneAction,
+    FinderErrorCode,
     JobPageFinderInput,
     JobPageFinderResult,
     ScrollAction,
     WaitAction,
 )
 from job_page_finder.vision import VisualContext, build_visual_context
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You find a page on a company website that displays at least one specific open job.
 
@@ -80,9 +84,13 @@ class JobPageFinder:
                 timeout=self.startup_timeout,
             )
         except TimeoutError:
-            result = self._failure(steps, f"Browser initialization timed out after {self.startup_timeout:g} seconds")
+            result = self._failure(
+                steps,
+                f"Browser initialization timed out after {self.startup_timeout:g} seconds",
+                "BROWSER_INITIALIZATION_TIMEOUT",
+            )
         except Exception as exc:
-            result = self._failure(steps, f"Browser initialization failed: {exc}")
+            result = self._failure(steps, f"Browser initialization failed: {exc}", "BROWSER_INITIALIZATION_FAILED")
         else:
             result = await self._run_loop(browser, finder_input)
         finally:
@@ -90,14 +98,14 @@ class JobPageFinder:
                 try:
                     await asyncio.wait_for(browser.kill(), timeout=self.startup_timeout)
                 except Exception:
-                    # Cleanup errors must not hide the task result or its original error.
-                    pass
+                    logger.warning("Browser cleanup failed", exc_info=True)
 
         return result
 
     async def _run_loop(self, browser: BrowserSession, finder_input: JobPageFinderInput) -> JobPageFinderResult:
         previous_result = "No previous action."
         consecutive_failures = 0
+        last_error_code: FinderErrorCode = "MAX_STEPS_REACHED"
 
         for step in range(1, finder_input.max_steps + 1):
             try:
@@ -107,42 +115,56 @@ class JobPageFinder:
                     visual_context = None
                     if self.use_vision:
                         visual_context = build_visual_context(state, max_candidates=self.max_visual_candidates)
-                    decision = await self._choose_action(
-                        company_url=str(finder_input.company_url),
-                        state=state,
-                        dom_text=dom_text,
-                        previous_result=previous_result,
-                        step=step,
-                        max_steps=finder_input.max_steps,
-                        visual_context=visual_context,
-                    )
-
-                    if isinstance(decision, DoneAction):
-                        validation_error = self._validate_done(decision, state, dom_text)
-                        if validation_error is None:
-                            return JobPageFinderResult(
-                                success=True,
-                                job_page_url=state.url,
-                                job_title=decision.job_title.strip(),
-                                evidence=decision.evidence.strip(),
-                                steps=step,
-                            )
-                        previous_result = f"done rejected: {validation_error}"
+                    try:
+                        decision = await self._choose_action(
+                            company_url=str(finder_input.company_url),
+                            state=state,
+                            dom_text=dom_text,
+                            previous_result=previous_result,
+                            step=step,
+                            max_steps=finder_input.max_steps,
+                            visual_context=visual_context,
+                        )
+                    except TimeoutError:
+                        raise
+                    except Exception as exc:
+                        previous_result = f"Action failed: {exc}"
                         consecutive_failures += 1
+                        last_error_code = "MODEL_ERROR"
                     else:
-                        previous_result = await self._execute_action(decision, state, browser)
-                        consecutive_failures = 0
+                        if isinstance(decision, DoneAction):
+                            validation_error = self._validate_done(decision, state, dom_text)
+                            if validation_error is None:
+                                return JobPageFinderResult(
+                                    success=True,
+                                    job_page_url=state.url,
+                                    job_title=decision.job_title.strip(),
+                                    evidence=decision.evidence.strip(),
+                                    steps=step,
+                                )
+                            previous_result = f"done rejected: {validation_error}"
+                            consecutive_failures += 1
+                            last_error_code = "VALIDATION_FAILED"
+                        else:
+                            previous_result = await self._execute_action(decision, state, browser)
+                            consecutive_failures = 0
             except TimeoutError:
                 previous_result = f"Step timed out after {self.step_timeout:g} seconds"
                 consecutive_failures += 1
+                last_error_code = "STEP_TIMEOUT"
             except Exception as exc:
                 previous_result = f"Action failed: {exc}"
                 consecutive_failures += 1
+                last_error_code = "ACTION_ERROR"
 
             if consecutive_failures >= self.max_consecutive_failures:
-                return self._failure(step, previous_result)
+                return self._failure(step, previous_result, last_error_code)
 
-        return self._failure(finder_input.max_steps, "Maximum steps reached without finding a specific job")
+        return self._failure(
+            finder_input.max_steps,
+            "Maximum steps reached without finding a specific job",
+            "MAX_STEPS_REACHED",
+        )
 
     async def _choose_action(
         self,
@@ -254,8 +276,8 @@ Choose exactly one next action. The JSON response must contain a single `decisio
         return " ".join(value.split()).casefold()
 
     @staticmethod
-    def _failure(steps: int, error: str) -> JobPageFinderResult:
-        return JobPageFinderResult(success=False, steps=steps, error=error)
+    def _failure(steps: int, error: str, error_code: FinderErrorCode) -> JobPageFinderResult:
+        return JobPageFinderResult(success=False, steps=steps, error=error, error_code=error_code)
 
     @staticmethod
     def _create_browser() -> BrowserSession:

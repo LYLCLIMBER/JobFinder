@@ -10,6 +10,7 @@
 | --- | --- | --- | --- |
 | JF-001 | Job Page Finder MVP | review | [spec](tasks/JF-001-job-page-finder-mvp/spec.md) · [handoff](tasks/JF-001-job-page-finder-mvp/handoff.md) · [verification](tasks/JF-001-job-page-finder-mvp/verification.md) |
 | JF-002 | Conditional Vision Fallback | review | [spec](tasks/JF-002-conditional-vision-fallback/spec.md) · [execution](tasks/JF-002-conditional-vision-fallback/execution.md) · [handoff](tasks/JF-002-conditional-vision-fallback/handoff.md) · [verification](tasks/JF-002-conditional-vision-fallback/verification.md) |
+| JF-003 | Unified Task Runtime | review | [spec](tasks/JF-003-unified-task-runtime/spec.md) · [execution](tasks/JF-003-unified-task-runtime/execution.md) · [handoff](tasks/JF-003-unified-task-runtime/handoff.md) · [verification](tasks/JF-003-unified-task-runtime/verification.md) |
 
 ## 阅读顺序
 

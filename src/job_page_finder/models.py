@@ -1,6 +1,16 @@
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
+
+FinderErrorCode = Literal[
+    "BROWSER_INITIALIZATION_FAILED",
+    "BROWSER_INITIALIZATION_TIMEOUT",
+    "STEP_TIMEOUT",
+    "MODEL_ERROR",
+    "ACTION_ERROR",
+    "VALIDATION_FAILED",
+    "MAX_STEPS_REACHED",
+]
 
 
 class JobPageFinderInput(BaseModel):
@@ -19,6 +29,13 @@ class JobPageFinderResult(BaseModel):
     evidence: str | None = None
     steps: int
     error: str | None = None
+    error_code: FinderErrorCode | None = None
+
+    @model_validator(mode="after")
+    def validate_success_fields(self) -> "JobPageFinderResult":
+        if self.success and not (self.job_page_url and self.job_title and self.evidence):
+            raise ValueError("successful result requires job_page_url, job_title, and evidence")
+        return self
 
 
 class ClickAction(BaseModel):

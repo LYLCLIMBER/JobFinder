@@ -24,6 +24,37 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
 
 ## 使用
 
+统一入口会校验任务、装配依赖并返回稳定的 JSON 结果：
+
+```python
+import asyncio
+
+from job_page_finder import run_task
+
+
+async def main() -> None:
+    result = await run_task(
+        {
+            "version": "v1",
+            "type": "find_job_page",
+            "payload": {"company_url": "https://example.com", "max_steps": 8},
+        }
+    )
+    print(result.model_dump_json(indent=2))
+
+
+asyncio.run(main())
+```
+
+```bash
+jobfinder find-job-page https://example.com --max-steps 8
+jobfinder run task.json
+```
+
+`jobfinder` 成功时退出码为 0；非法输入为 2；配置错误为 3；任务执行失败为 1。标准输出只包含最终 JSON，诊断日志写入标准错误。
+
+也可以继续直接调用领域执行器：
+
 ```python
 import asyncio
 
