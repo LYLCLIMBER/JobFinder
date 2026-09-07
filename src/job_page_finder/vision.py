@@ -15,6 +15,7 @@ class VisualContext:
 
     image_data_url: str
     annotated_indexes: tuple[int, ...]
+    candidates: tuple[tuple[int, tuple[int, int, int, int]], ...]
 
 
 def build_visual_context(
@@ -50,6 +51,7 @@ def build_visual_context(
         return VisualContext(
             image_data_url=f"data:image/png;base64,{encoded}",
             annotated_indexes=tuple(index for index, _ in candidates),
+            candidates=tuple(candidates),
         )
     except Exception:
         return None

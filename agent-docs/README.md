@@ -11,6 +11,9 @@
 | JF-001 | Job Page Finder MVP | review | [spec](tasks/JF-001-job-page-finder-mvp/spec.md) · [handoff](tasks/JF-001-job-page-finder-mvp/handoff.md) · [verification](tasks/JF-001-job-page-finder-mvp/verification.md) |
 | JF-002 | Conditional Vision Fallback | review | [spec](tasks/JF-002-conditional-vision-fallback/spec.md) · [execution](tasks/JF-002-conditional-vision-fallback/execution.md) · [handoff](tasks/JF-002-conditional-vision-fallback/handoff.md) · [verification](tasks/JF-002-conditional-vision-fallback/verification.md) |
 | JF-003 | Unified Task Runtime | review | [spec](tasks/JF-003-unified-task-runtime/spec.md) · [execution](tasks/JF-003-unified-task-runtime/execution.md) · [handoff](tasks/JF-003-unified-task-runtime/handoff.md) · [verification](tasks/JF-003-unified-task-runtime/verification.md) |
+| JF-004 | Runtime Diagnostics | review | [spec](tasks/JF-004-runtime-diagnostics/spec.md) · [execution](tasks/JF-004-runtime-diagnostics/execution.md) · [handoff](tasks/JF-004-runtime-diagnostics/handoff.md) · [verification](tasks/JF-004-runtime-diagnostics/verification.md) |
+| JF-005 | Test Diagnostics Isolation | done | [spec](tasks/JF-005-test-diagnostics-isolation/spec.md) · [handoff](tasks/JF-005-test-diagnostics-isolation/handoff.md) · [verification](tasks/JF-005-test-diagnostics-isolation/verification.md) |
+| JF-006 | Default Vision and Kurogames Test | review | [spec](tasks/JF-006-default-vision-and-kurogames-test/spec.md) · [handoff](tasks/JF-006-default-vision-and-kurogames-test/handoff.md) · [verification](tasks/JF-006-default-vision-and-kurogames-test/verification.md) |
 
 ## 阅读顺序
 

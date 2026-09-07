@@ -153,7 +153,7 @@ async def test_completes_when_home_page_contains_a_job() -> None:
             }
         ]
     )
-    finder, _ = make_finder(browser, llm)
+    finder, _ = make_finder(browser, llm, use_vision=False)
 
     result = await finder.find(JobPageFinderInput(company_url="https://example.com"))
 

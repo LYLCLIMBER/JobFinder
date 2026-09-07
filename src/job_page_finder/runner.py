@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 import uuid
@@ -6,6 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from job_page_finder.diagnostics import DiagnosticWriter, reset_current_diagnostics, set_current_diagnostics
 from job_page_finder.finder import JobPageFinder
 from job_page_finder.models import JobPageFinderInput, JobPageFinderResult
 
@@ -186,76 +188,94 @@ class TaskRunner:
         else:
             self._execute_find = finder
 
-    async def run(self, request: TaskRequest | Mapping[str, Any], *, emit_started: bool = True) -> TaskResult:
+    async def run(
+        self,
+        request: TaskRequest | Mapping[str, Any],
+        *,
+        emit_started: bool = True,
+        diagnostics: DiagnosticWriter | None = None,
+    ) -> TaskResult:
         started = time.perf_counter()
         task_id, task_type = request_identity(request)
-        if emit_started:
-            log_task_started(task_id, task_type)
+        token = set_current_diagnostics(diagnostics)
         try:
-            parsed = self.parse_request(request)
-            task_type = parsed.type
-            result = await self._execute_find(parsed.payload)
-            duration_ms = _elapsed_ms(started)
-            if result.success:
-                if not (result.job_page_url and result.job_title and result.evidence):
+            if diagnostics is not None:
+                diagnostics.event("task_started")
+            if emit_started:
+                log_task_started(task_id, task_type)
+            try:
+                parsed = self.parse_request(request)
+                task_type = parsed.type
+                result = await self._execute_find(parsed.payload)
+                duration_ms = _elapsed_ms(started)
+                if result.success:
+                    if not (result.job_page_url and result.job_title and result.evidence):
+                        task_result = build_failed_result(
+                            task_id=task_id,
+                            task_type=task_type,
+                            code="INTERNAL_ERROR",
+                            message="Finder returned a successful result without job page fields",
+                            duration_ms=duration_ms,
+                        )
+                    else:
+                        task_result = TaskResult(
+                            version="v1",
+                            task_id=task_id,
+                            type=task_type,
+                            status="succeeded",
+                            output=FindJobPageOutput(
+                                job_page_url=result.job_page_url,
+                                job_title=result.job_title,
+                                evidence=result.evidence,
+                                steps=result.steps,
+                            ),
+                            error=None,
+                            metadata=TaskMetadata(duration_ms=duration_ms),
+                        )
+                else:
+                    code: TaskErrorCode = result.error_code or "INTERNAL_ERROR"
                     task_result = build_failed_result(
                         task_id=task_id,
                         task_type=task_type,
-                        code="INTERNAL_ERROR",
-                        message="Finder returned a successful result without job page fields",
+                        code=code,
+                        message=result.error or "Task failed",
                         duration_ms=duration_ms,
                     )
-                else:
-                    task_result = TaskResult(
-                        version="v1",
-                        task_id=task_id,
-                        type=task_type,
-                        status="succeeded",
-                        output=FindJobPageOutput(
-                            job_page_url=result.job_page_url,
-                            job_title=result.job_title,
-                            evidence=result.evidence,
-                            steps=result.steps,
-                        ),
-                        error=None,
-                        metadata=TaskMetadata(duration_ms=duration_ms),
-                    )
-            else:
-                code: TaskErrorCode = result.error_code or "INTERNAL_ERROR"
+            except _UnsupportedTaskTypeError as exc:
+                task_result = build_failed_result(
+                    task_id=task_id,
+                    task_type=exc.task_type,
+                    code="UNSUPPORTED_TASK_TYPE",
+                    message=str(exc),
+                    duration_ms=_elapsed_ms(started),
+                )
+            except _InvalidTaskError as exc:
                 task_result = build_failed_result(
                     task_id=task_id,
                     task_type=task_type,
-                    code=code,
-                    message=result.error or "Task failed",
-                    duration_ms=duration_ms,
+                    code="INVALID_TASK",
+                    message=str(exc),
+                    duration_ms=_elapsed_ms(started),
                 )
-        except _UnsupportedTaskTypeError as exc:
-            task_result = build_failed_result(
-                task_id=task_id,
-                task_type=exc.task_type,
-                code="UNSUPPORTED_TASK_TYPE",
-                message=str(exc),
-                duration_ms=_elapsed_ms(started),
-            )
-        except _InvalidTaskError as exc:
-            task_result = build_failed_result(
-                task_id=task_id,
-                task_type=task_type,
-                code="INVALID_TASK",
-                message=str(exc),
-                duration_ms=_elapsed_ms(started),
-            )
-        except Exception as exc:
-            task_result = build_failed_result(
-                task_id=task_id,
-                task_type=task_type,
-                code="INTERNAL_ERROR",
-                message=_exception_message(exc),
-                duration_ms=_elapsed_ms(started),
-            )
+            except Exception as exc:
+                task_result = build_failed_result(
+                    task_id=task_id,
+                    task_type=task_type,
+                    code="INTERNAL_ERROR",
+                    message=_exception_message(exc),
+                    duration_ms=_elapsed_ms(started),
+                )
 
-        log_task_finished(task_result)
-        return task_result
+            log_task_finished(task_result)
+            if diagnostics is not None:
+                diagnostics.finish(task_result.model_dump(mode="json"))
+            return task_result
+        except asyncio.CancelledError:
+            if diagnostics is not None:
+                diagnostics.abort()
+            raise
+        finally:
+            reset_current_diagnostics(token)
 
     @staticmethod
     def parse_request(request: TaskRequest | Mapping[str, Any]) -> TaskRequest:

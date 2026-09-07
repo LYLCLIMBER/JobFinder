@@ -54,6 +54,23 @@ def test_find_job_page_shortcut_prints_json_and_exits_zero(monkeypatch, capsys) 
     assert not stderr or "task_id=" in stderr
 
 
+def test_cli_default_diagnostics_root_uses_test_tmp_path(monkeypatch, capsys, isolate_default_diagnostics_root) -> None:
+    install_fake_finder(
+        monkeypatch,
+        JobPageFinderResult(
+            success=True,
+            job_page_url="https://example.com/careers",
+            job_title="Senior Backend Engineer",
+            evidence="Senior Backend Engineer",
+            steps=1,
+        ),
+    )
+
+    assert main(["find-job-page", "https://example.com"]) == EXIT_SUCCESS
+    parse_stdout(capsys)
+    assert len([path for path in isolate_default_diagnostics_root.iterdir() if path.is_dir()]) == 1
+
+
 def test_run_json_file_uses_the_same_result_contract(monkeypatch, capsys, tmp_path: Path) -> None:
     """Read a JSON task file and print the same unified result envelope."""
     install_fake_finder(

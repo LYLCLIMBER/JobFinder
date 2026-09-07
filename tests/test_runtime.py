@@ -4,6 +4,7 @@ import logging
 import pytest
 
 from job_page_finder import cli, runtime
+from job_page_finder.finder import JobPageFinder
 from job_page_finder.models import JobPageFinderInput, JobPageFinderResult
 from job_page_finder.runner import TaskRunner
 from job_page_finder.runtime import RuntimeConfig, create_runner, run_task
@@ -56,6 +57,23 @@ def test_create_runner_wires_injected_dependencies(monkeypatch) -> None:
     assert captured["max_visual_candidates"] == 4
 
 
+def test_default_vision_is_enabled_and_can_be_explicitly_disabled(monkeypatch) -> None:
+    captured: list[bool] = []
+
+    class FakeFinder:
+        def __init__(self, llm, **kwargs) -> None:
+            captured.append(kwargs["use_vision"])
+
+    monkeypatch.setattr("job_page_finder.runtime.JobPageFinder", FakeFinder)
+
+    assert RuntimeConfig().use_vision is True
+    assert JobPageFinder(llm=object()).use_vision is True
+    create_runner(llm=object())
+    create_runner(llm=object(), config=RuntimeConfig(use_vision=False))
+
+    assert captured == [True, False]
+
+
 @pytest.mark.asyncio
 async def test_run_task_uses_create_runner_unless_runner_is_injected(monkeypatch) -> None:
     """Create a runner through the composition root when the caller does not supply one."""
@@ -89,6 +107,32 @@ async def test_run_task_uses_create_runner_unless_runner_is_injected(monkeypatch
     second = await run_task(request, runner=TaskRunner(fake_find))
     assert second.status == "succeeded"
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_task_default_diagnostics_root_uses_test_tmp_path(isolate_default_diagnostics_root) -> None:
+    async def fake_find(finder_input: JobPageFinderInput) -> JobPageFinderResult:
+        return JobPageFinderResult(
+            success=True,
+            job_page_url="https://example.com/careers",
+            job_title="Senior Backend Engineer",
+            evidence="Senior Backend Engineer",
+            steps=1,
+        )
+
+    result = await run_task(
+        {
+            "version": "v1",
+            "task_id": "isolated-runtime",
+            "type": "find_job_page",
+            "payload": {"company_url": "https://example.com"},
+        },
+        runner=TaskRunner(fake_find),
+    )
+
+    assert result.status == "succeeded"
+    assert RuntimeConfig().diagnostics_root == isolate_default_diagnostics_root
+    assert len([path for path in isolate_default_diagnostics_root.iterdir() if path.is_dir()]) == 1
 
 
 @pytest.mark.asyncio
