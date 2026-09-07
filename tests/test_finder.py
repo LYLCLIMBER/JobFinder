@@ -42,6 +42,7 @@ class FakeBrowser:
         start_delay: float = 0,
         navigate_delay: float = 0,
         kill_error: Exception | None = None,
+        route_urls: list[str] | None = None,
     ) -> None:
         self.states = states
         self.position = 0
@@ -49,6 +50,8 @@ class FakeBrowser:
         self.start_delay = start_delay
         self.navigate_delay = navigate_delay
         self.kill_error = kill_error
+        self.route_urls = list(route_urls or [])
+        self.current_url_calls = 0
         self.started = False
         self.killed = False
         self.navigated_to: str | None = None
@@ -70,6 +73,14 @@ class FakeBrowser:
         self.screenshot_options.append(include_screenshot)
         return self.states[self.position]
 
+    async def get_current_page_url(self) -> str:
+        self.current_url_calls += 1
+        if len(self.route_urls) > 1:
+            return self.route_urls.pop(0)
+        if self.route_urls:
+            return self.route_urls[0]
+        return self.states[self.position].url
+
     async def kill(self) -> None:
         self.killed = True
         if self.kill_error:
@@ -83,17 +94,64 @@ class FakeTools:
     def __init__(self) -> None:
         self.clicks: list[int] = []
         self.scrolls: list[bool] = []
+        self.scroll_indexes: list[int | None] = []
 
     async def click(self, *, index: int, browser_session: FakeBrowser) -> ActionResult:
         self.clicks.append(index)
         browser_session.advance()
         return ActionResult(extracted_content=f"Clicked element {index}")
 
-    async def scroll(self, *, down: bool, pages: float, browser_session: FakeBrowser) -> ActionResult:
+    async def scroll(
+        self, *, down: bool, pages: float, browser_session: FakeBrowser, index: int | None = None
+    ) -> ActionResult:
         assert pages == 1.0
         self.scrolls.append(down)
+        self.scroll_indexes.append(index)
         browser_session.advance()
         return ActionResult(extracted_content="Scrolled down" if down else "Scrolled up")
+
+
+class FakeScrollNode:
+    def __init__(self, offset: float) -> None:
+        self.backend_node_id = 700
+        self.tag_name = "main"
+        self.is_visible = True
+        self.is_actually_scrollable = True
+        self.scroll_info = {
+            "scroll_top": offset,
+            "content_above": offset,
+            "content_below": 200 - offset,
+        }
+        self.absolute_position = type("Rect", (), {"x": 0, "y": 0, "width": 200, "height": 100})()
+        self.parent_node = None
+        self.attributes = {}
+
+    def get_meaningful_text_for_llm(self) -> str:
+        return "Job list"
+
+
+def scroll_state(*, root_offset: int, inner_offset: int) -> FakeState:
+    node = FakeScrollNode(inner_offset)
+    simplified = type("Simplified", (), {"original_node": node, "children": []})()
+    dom_state = FakeDomState("[7]<main>Job list</main>", {7: node})
+    dom_state._root = simplified
+    return FakeState(
+        url="https://example.com/",
+        title="Example Company",
+        dom_state=dom_state,
+        page_info=type(
+            "PageInfo",
+            (),
+            {
+                "viewport_width": 200,
+                "viewport_height": 100,
+                "scroll_x": 0,
+                "scroll_y": root_offset,
+                "pixels_above": root_offset,
+                "pixels_below": 0,
+            },
+        )(),
+    )
 
 
 class FakeLlm:
@@ -131,6 +189,8 @@ def state(text: str, *, url: str = "https://example.com/", indexes: tuple[int, .
 
 def make_finder(browser: FakeBrowser, llm: FakeLlm, **kwargs) -> tuple[JobPageFinder, FakeTools]:
     tools = FakeTools()
+    kwargs.setdefault("scroll_route_timeout", 0.01)
+    kwargs.setdefault("scroll_route_poll_interval", 0.001)
     finder = JobPageFinder(
         llm=llm,
         browser_factory=lambda: browser,
@@ -207,7 +267,7 @@ async def test_sends_annotated_screenshot_when_textless_candidate_exists() -> No
             )
         ]
     )
-    llm = FakeLlm([{"type": "scroll", "direction": "down"}])
+    llm = FakeLlm([{"type": "wait", "seconds": 1}])
     finder, _ = make_finder(browser, llm, use_vision=True, max_consecutive_failures=1)
 
     result = await finder.find(JobPageFinderInput(company_url="https://example.com", max_steps=1))
@@ -251,8 +311,8 @@ async def test_fails_at_max_steps_when_no_specific_job_is_found() -> None:
     browser = FakeBrowser([state("<h1>Careers at Example</h1>")])
     llm = FakeLlm(
         [
-            {"type": "scroll", "direction": "down"},
-            {"type": "scroll", "direction": "up"},
+            {"type": "wait", "seconds": 1},
+            {"type": "wait", "seconds": 1},
         ]
     )
     finder, _ = make_finder(browser, llm)
@@ -265,6 +325,139 @@ async def test_fails_at_max_steps_when_no_specific_job_is_found() -> None:
     assert result.error_code == "MAX_STEPS_REACHED"
     assert len(llm.calls) == 2
     assert browser.killed is True
+
+
+@pytest.mark.asyncio
+async def test_root_scroll_falls_back_to_internal_target_and_reports_actual_distance() -> None:
+    browser = FakeBrowser(
+        [
+            scroll_state(root_offset=0, inner_offset=0),
+            scroll_state(root_offset=0, inner_offset=0),
+            scroll_state(root_offset=0, inner_offset=100),
+        ]
+    )
+    llm = FakeLlm([{"type": "scroll", "direction": "down"}, {"type": "wait", "seconds": 1}])
+    finder, tools = make_finder(browser, llm)
+
+    result = await finder.find(JobPageFinderInput(company_url="https://example.com", max_steps=2))
+
+    assert result.error_code == "MAX_STEPS_REACHED"
+    assert tools.scrolls == [True, True]
+    assert tools.scroll_indexes == [None, 7]
+    assert browser.current_url_calls > 0
+    assert "Scrolled element [7] down by 100px" in llm.calls[1][-1].text
+
+
+@pytest.mark.asyncio
+async def test_root_gesture_that_moves_internal_target_does_not_scroll_twice() -> None:
+    browser = FakeBrowser(
+        [
+            scroll_state(root_offset=0, inner_offset=0),
+            scroll_state(root_offset=0, inner_offset=100),
+        ]
+    )
+    llm = FakeLlm([{"type": "scroll", "direction": "down"}, {"type": "wait", "seconds": 1}])
+    finder, tools = make_finder(browser, llm)
+
+    result = await finder.find(JobPageFinderInput(company_url="https://example.com", max_steps=2))
+
+    assert result.error_code == "MAX_STEPS_REACHED"
+    assert tools.scroll_indexes == [None]
+    assert browser.current_url_calls == 1
+    assert "Scrolled element [7] down by 100px" in llm.calls[1][-1].text
+
+
+@pytest.mark.asyncio
+async def test_scroll_detects_delayed_route_change_without_internal_fallback() -> None:
+    browser = FakeBrowser(
+        [
+            scroll_state(root_offset=0, inner_offset=0),
+            scroll_state(root_offset=0, inner_offset=0),
+        ],
+        route_urls=[
+            "https://example.com/",
+            "https://example.com/",
+            "https://example.com/?page=product",
+        ],
+    )
+    llm = FakeLlm([{"type": "scroll", "direction": "down"}, {"type": "wait", "seconds": 1}])
+    finder, tools = make_finder(browser, llm, scroll_route_timeout=0.1, use_vision=False)
+
+    result = await finder.find(JobPageFinderInput(company_url="https://example.com", max_steps=2))
+
+    assert result.error_code == "MAX_STEPS_REACHED"
+    assert tools.scroll_indexes == [None]
+    assert browser.current_url_calls == 3
+    assert "Wheel gesture changed route to https://example.com/?page=product" in llm.calls[1][-1].text
+    assert browser.screenshot_options == [False, False, False]
+
+
+@pytest.mark.asyncio
+async def test_scroll_uses_live_url_as_route_baseline() -> None:
+    browser = FakeBrowser(
+        [
+            scroll_state(root_offset=0, inner_offset=0),
+            scroll_state(root_offset=0, inner_offset=0),
+            scroll_state(root_offset=0, inner_offset=100),
+        ],
+        route_urls=["https://example.com/?page=product"],
+    )
+    llm = FakeLlm([{"type": "scroll", "direction": "down"}, {"type": "wait", "seconds": 1}])
+    finder, tools = make_finder(browser, llm)
+
+    result = await finder.find(JobPageFinderInput(company_url="https://example.com", max_steps=2))
+
+    assert result.error_code == "MAX_STEPS_REACHED"
+    assert tools.scroll_indexes == [None, 7]
+    assert "Scrolled element [7] down by 100px" in llm.calls[1][-1].text
+
+
+@pytest.mark.asyncio
+async def test_scroll_without_actual_offset_change_is_an_action_error() -> None:
+    browser = FakeBrowser([scroll_state(root_offset=0, inner_offset=0)])
+    llm = FakeLlm([{"type": "scroll", "direction": "down", "index": 7}])
+    finder, tools = make_finder(browser, llm, max_consecutive_failures=1)
+
+    result = await finder.find(JobPageFinderInput(company_url="https://example.com", max_steps=1))
+
+    assert result.error_code == "ACTION_ERROR"
+    assert result.error == "Action failed: Scroll had no effect on the root page or available scroll targets"
+    assert tools.scroll_indexes == [7]
+    assert browser.current_url_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_scroll_route_polling_stops_at_step_deadline() -> None:
+    browser = FakeBrowser(
+        [state("<div>Careers</div>")],
+    )
+    llm = FakeLlm([{"type": "scroll", "direction": "down"}])
+    finder, tools = make_finder(
+        browser,
+        llm,
+        max_consecutive_failures=1,
+        step_timeout=0.1,
+        scroll_route_timeout=1,
+        scroll_route_poll_interval=0.01,
+    )
+
+    result = await finder.find(JobPageFinderInput(company_url="https://example.com", max_steps=1))
+
+    assert result.error_code == "STEP_TIMEOUT"
+    assert tools.scroll_indexes == [None]
+    assert browser.current_url_calls > 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_unavailable_scroll_target_is_rejected() -> None:
+    browser = FakeBrowser([state("<div>Careers</div>")])
+    llm = FakeLlm([{"type": "scroll", "direction": "down", "index": 99}])
+    finder, _ = make_finder(browser, llm, max_consecutive_failures=1)
+
+    result = await finder.find(JobPageFinderInput(company_url="https://example.com", max_steps=1))
+
+    assert result.error_code == "ACTION_ERROR"
+    assert "Scroll target index 99 is not available" in result.error
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,8 @@
 | JF-004 | Runtime Diagnostics | review | [spec](tasks/JF-004-runtime-diagnostics/spec.md) · [execution](tasks/JF-004-runtime-diagnostics/execution.md) · [handoff](tasks/JF-004-runtime-diagnostics/handoff.md) · [verification](tasks/JF-004-runtime-diagnostics/verification.md) |
 | JF-005 | Test Diagnostics Isolation | done | [spec](tasks/JF-005-test-diagnostics-isolation/spec.md) · [handoff](tasks/JF-005-test-diagnostics-isolation/handoff.md) · [verification](tasks/JF-005-test-diagnostics-isolation/verification.md) |
 | JF-006 | Default Vision and Kurogames Test | review | [spec](tasks/JF-006-default-vision-and-kurogames-test/spec.md) · [handoff](tasks/JF-006-default-vision-and-kurogames-test/handoff.md) · [verification](tasks/JF-006-default-vision-and-kurogames-test/verification.md) |
+| JF-007 | Targeted Scroll Discovery and Verification | done | [spec](tasks/JF-007-targeted-scroll/spec.md) · [execution](tasks/JF-007-targeted-scroll/execution.md) · [handoff](tasks/JF-007-targeted-scroll/handoff.md) · [verification](tasks/JF-007-targeted-scroll/verification.md) |
+| JF-008 | Asynchronous Scroll Route Detection | done | [spec](tasks/JF-008-scroll-route-detection/spec.md) · [execution](tasks/JF-008-scroll-route-detection/execution.md) · [handoff](tasks/JF-008-scroll-route-detection/handoff.md) · [verification](tasks/JF-008-scroll-route-detection/verification.md) |
 
 ## 阅读顺序
 

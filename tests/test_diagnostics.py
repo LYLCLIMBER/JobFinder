@@ -60,9 +60,12 @@ class FakeBrowser:
         self.screenshot_options.append(include_screenshot)
         if self.state_delay:
             await asyncio.sleep(self.state_delay)
-        if len(self.screenshot_options) > 1 and self.action_snapshot_delay:
+        if len(self.screenshot_options) > 1 and self.action_snapshot_delay and include_screenshot:
             await asyncio.sleep(self.action_snapshot_delay)
         return self.state
+
+    async def get_current_page_url(self) -> str:
+        return self.state.url
 
     async def kill(self) -> None:
         pass
@@ -80,6 +83,9 @@ class FakeLlm:
 
 class FakeTools:
     async def scroll(self, **kwargs: Any) -> Any:
+        page_info = kwargs["browser_session"].state.page_info
+        page_info.scroll_y += 10
+        page_info.pixels_above += 10
         return SimpleNamespace(error=None, extracted_content="Scrolled")
 
 

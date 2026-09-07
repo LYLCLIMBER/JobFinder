@@ -50,6 +50,7 @@ class ScrollAction(BaseModel):
 
     type: Literal["scroll"]
     direction: Literal["up", "down"]
+    index: int | None = Field(default=None, ge=0)
 
 
 class WaitAction(BaseModel):

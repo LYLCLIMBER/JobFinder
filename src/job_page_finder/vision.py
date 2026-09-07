@@ -23,6 +23,7 @@ def build_visual_context(
     *,
     max_candidates: int = 20,
     min_visible_fraction: float = 0.2,
+    scroll_targets: tuple[Any, ...] = (),
 ) -> VisualContext | None:
     """Annotate reliable textless interactive elements in the current screenshot."""
     screenshot = getattr(state, "screenshot", None)
@@ -36,7 +37,9 @@ def build_visual_context(
         return None
 
     try:
-        candidates = _find_candidates(state, page_info, image.size, max_candidates, min_visible_fraction)
+        scroll_candidates = _scroll_target_candidates(scroll_targets, page_info, image.size, min_visible_fraction)
+        regular_candidates = _find_candidates(state, page_info, image.size, max_candidates, min_visible_fraction)
+        candidates = _merge_candidates(scroll_candidates, regular_candidates, max_candidates)
         if not candidates:
             return None
 
@@ -107,6 +110,59 @@ def _find_candidates(
 
     candidates.sort(key=lambda candidate: (-candidate[2], candidate[0]))
     return [(index, box) for index, box, _ in candidates[:max_candidates]]
+
+
+def _scroll_target_candidates(
+    scroll_targets: tuple[Any, ...],
+    page_info: Any,
+    image_size: tuple[int, int],
+    min_visible_fraction: float,
+) -> list[tuple[int, tuple[int, int, int, int]]]:
+    viewport_width = _positive_number(getattr(page_info, "viewport_width", None))
+    viewport_height = _positive_number(getattr(page_info, "viewport_height", None))
+    if viewport_width is None or viewport_height is None:
+        return []
+    scroll_x = _finite_number(getattr(page_info, "scroll_x", 0)) or 0
+    scroll_y = _finite_number(getattr(page_info, "scroll_y", 0)) or 0
+    candidates = []
+    for target in scroll_targets:
+        bounds = getattr(target, "bounds", None)
+        if bounds is None:
+            continue
+        coordinates = [_finite_number(getattr(bounds, field, None)) for field in ("x", "y", "width", "height")]
+        if any(value is None for value in coordinates):
+            continue
+        x, y, width, height = coordinates
+        if width <= 0 or height <= 0:
+            continue
+        viewport_box = (x - scroll_x, y - scroll_y, x - scroll_x + width, y - scroll_y + height)
+        visible_box = _intersect(viewport_box, (0, 0, viewport_width, viewport_height))
+        if visible_box is None:
+            continue
+        visible_area = (visible_box[2] - visible_box[0]) * (visible_box[3] - visible_box[1])
+        if visible_area / (width * height) < min_visible_fraction:
+            continue
+        pixel_box = _to_pixel_box(visible_box, viewport_width, viewport_height, image_size)
+        if pixel_box is not None:
+            candidates.append((int(target.index), pixel_box))
+    return candidates
+
+
+def _merge_candidates(
+    preferred: list[tuple[int, tuple[int, int, int, int]]],
+    regular: list[tuple[int, tuple[int, int, int, int]]],
+    limit: int,
+) -> list[tuple[int, tuple[int, int, int, int]]]:
+    merged: list[tuple[int, tuple[int, int, int, int]]] = []
+    seen = set()
+    for candidate in [*preferred, *regular]:
+        if candidate[0] in seen:
+            continue
+        seen.add(candidate[0])
+        merged.append(candidate)
+        if len(merged) == limit:
+            break
+    return merged
 
 
 def _is_textless(node: Any) -> bool:

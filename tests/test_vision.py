@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from PIL import Image
 
+from job_page_finder.scrolling import ScrollTarget
 from job_page_finder.vision import build_visual_context
 
 
@@ -94,3 +95,23 @@ def test_build_visual_context_accounts_for_scroll_position() -> None:
 
     assert context is not None
     assert context.annotated_indexes == (18,)
+
+
+def test_build_visual_context_marks_scroll_target_even_when_it_has_text() -> None:
+    node = FakeNode(text="Job list", bounds=SimpleNamespace(x=20, y=20, width=300, height=150))
+    target = ScrollTarget(
+        index=25,
+        node=node,
+        offset=0,
+        remaining_up=0,
+        remaining_down=400,
+        bounds=node.absolute_position,
+    )
+
+    context = build_visual_context(
+        make_state({}, screenshot=screenshot_data_url()),
+        scroll_targets=(target,),
+    )
+
+    assert context is not None
+    assert context.annotated_indexes == (25,)
