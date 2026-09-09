@@ -53,6 +53,49 @@ jobfinder run task.json
 
 `jobfinder` 成功时退出码为 0；非法输入为 2；配置错误为 3；任务执行失败为 1。标准输出只包含最终 JSON，诊断日志写入标准错误。
 
+## 批量运行评估
+
+评估工具从 CorpWeb 数据库中只抽取 `status=VALID` 且具有合法规范化 URL 的企业站点，按交易所和
+板块比例分层，并在每层中轮询行业以增加样本多样性。输出格式只包含通用的企业名称、实际成功访问
+URL、来源和抽样桶；证券市场字段只用于生成阶段的分层，不会写入验证集或传给 JobFinder。
+
+生成默认 120 条样本：
+
+```bash
+jobfinder evaluate generate \
+  --db ../CorpWeb/data/companies.sqlite3 \
+  --output evaluation/corpweb-pilot-v1/cases.jsonl
+```
+
+以最多两个并发浏览器执行，并在每条完成后立即追加结果：
+
+```bash
+jobfinder evaluate run \
+  --dataset evaluation/corpweb-pilot-v1/cases.jsonl \
+  --run-id baseline
+```
+
+结果默认写入 `evaluation/corpweb-pilot-v1/runs/baseline/results.jsonl`，运行 manifest 和锁文件会作为
+sidecar 放在同一目录；默认诊断级别为 `diagnostic`，诊断写入同目录下的
+`diagnostics-diagnostic/`。可用 `--results`、`--diagnostics-root`、`--diagnostics-level`、`--workers`、
+`--case-timeout` 和其他诊断参数覆盖默认值。
+
+相同数据集、run ID 和运行配置再次执行时会跳过已有结果，实现中断续跑。不同配置应使用新的结果
+文件和 run ID。
+
+生成机器可读和 Markdown 汇总：
+
+```bash
+jobfinder evaluate summarize \
+  --dataset evaluation/corpweb-pilot-v1/cases.jsonl \
+  --results evaluation/corpweb-pilot-v1/runs/baseline/results.jsonl \
+  --json-output evaluation/corpweb-pilot-v1/summary.json \
+  --markdown-output evaluation/corpweb-pilot-v1/summary.md
+```
+
+该评估集没有人工真值，报告中的成功率是 JobFinder 自报成功率，只用于回答系统能否完成运行、耗时
+多少以及主要错误出现在哪里，不表示真实准确率或召回率。
+
 ### 运行时诊断
 
 每个 `run_task()` 运行默认在 `log/diagnostics/` 创建一个独立的 `basic` 诊断目录，包含

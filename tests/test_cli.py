@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from job_page_finder.cli import (
     EXIT_CONFIGURATION_ERROR,
     EXIT_INVALID_INPUT,
@@ -8,8 +10,9 @@ from job_page_finder.cli import (
     EXIT_TASK_FAILED,
     main,
 )
+from job_page_finder.evaluation import EvaluationCase
 from job_page_finder.models import JobPageFinderInput, JobPageFinderResult
-from job_page_finder.runner import TaskRunner
+from job_page_finder.runner import FindJobPageOutput, TaskMetadata, TaskResult, TaskRunner
 
 
 def install_fake_finder(monkeypatch, result: JobPageFinderResult | Exception):
@@ -227,3 +230,204 @@ def test_usage_error_prints_json_on_stdout(capsys) -> None:
     assert exit_code == EXIT_INVALID_INPUT
     assert payload["error"]["code"] == "INVALID_TASK"
     assert payload["status"] == "failed"
+
+
+def test_evaluate_generate_prints_manifest(monkeypatch, capsys, tmp_path: Path) -> None:
+    captured: dict = {}
+
+    def fake_generate(db_path, output_path, **kwargs):
+        captured.update({"db_path": db_path, "output_path": output_path, **kwargs})
+        return {"source": "corpweb", "selected_count": 12}
+
+    monkeypatch.setattr("job_page_finder.cli.generate_corpweb_dataset", fake_generate)
+    exit_code = main(
+        [
+            "evaluate",
+            "generate",
+            "--db",
+            str(tmp_path / "companies.sqlite3"),
+            "--output",
+            str(tmp_path / "cases.jsonl"),
+            "--sample-size",
+            "12",
+            "--seed",
+            "fixed",
+        ]
+    )
+    payload, _ = parse_stdout(capsys)
+
+    assert exit_code == EXIT_SUCCESS
+    assert payload == {"selected_count": 12, "source": "corpweb"}
+    assert captured["sample_size"] == 12
+    assert captured["seed"] == "fixed"
+
+
+def test_evaluate_run_passes_bounded_execution_options(monkeypatch, capsys, tmp_path: Path) -> None:
+    captured: dict = {}
+
+    async def fake_run(dataset, results, **kwargs):
+        captured.update({"dataset": dataset, "results": results, **kwargs})
+        return {"total_cases": 4, "completed_cases": 4, "self_reported_success_rate": 0.5}
+
+    monkeypatch.setattr("job_page_finder.cli.run_evaluation", fake_run)
+    exit_code = main(
+        [
+            "evaluate",
+            "run",
+            "--dataset",
+            str(tmp_path / "cases.jsonl"),
+            "--results",
+            str(tmp_path / "results.jsonl"),
+            "--workers",
+            "3",
+            "--case-timeout",
+            "90",
+            "--run-id",
+            "pilot",
+        ]
+    )
+    payload, _ = parse_stdout(capsys)
+
+    assert exit_code == EXIT_SUCCESS
+    assert payload["completed_cases"] == 4
+    assert captured["workers"] == 3
+    assert captured["case_timeout"] == 90
+    assert captured["run_id"] == "pilot"
+
+
+def test_evaluate_run_derives_result_and_diagnostics_paths(monkeypatch, capsys, tmp_path: Path) -> None:
+    captured: dict = {}
+
+    async def fake_run(dataset, results, **kwargs):
+        captured.update({"dataset": dataset, "results": results, **kwargs})
+        return {"total_cases": 0, "completed_cases": 0, "self_reported_success_rate": 0.0}
+
+    monkeypatch.setattr("job_page_finder.cli.run_evaluation", fake_run)
+    dataset = tmp_path / "evaluation" / "cases.jsonl"
+
+    assert (
+        main(
+            [
+                "evaluate",
+                "run",
+                "--dataset",
+                str(dataset),
+                "--run-id",
+                "pilot",
+            ]
+        )
+        == EXIT_SUCCESS
+    )
+    parse_stdout(capsys)
+
+    assert captured["results"] == tmp_path / "evaluation" / "runs" / "pilot" / "results.jsonl"
+    assert captured["config"].diagnostics_level == "diagnostic"
+    assert captured["config"].diagnostics_root == (
+        tmp_path / "evaluation" / "runs" / "pilot" / "diagnostics-diagnostic"
+    )
+
+
+def test_evaluate_run_creates_default_sidecars(monkeypatch, capsys, tmp_path: Path) -> None:
+    captured: dict = {}
+    dataset = tmp_path / "evaluation" / "cases.jsonl"
+    dataset.parent.mkdir()
+    case = EvaluationCase(
+        case_id="corpweb:SSE:600001",
+        company_name="Company",
+        company_url="https://example.com/",
+        source="corpweb",
+        sample_bucket="SSE:MAIN",
+    )
+    dataset.write_text(case.model_dump_json() + "\n", encoding="utf-8")
+
+    async def fake_run_task(request, config):
+        captured["config"] = config
+        return TaskResult(
+            version="v1",
+            task_id=request["task_id"],
+            type="find_job_page",
+            status="succeeded",
+            output=FindJobPageOutput(
+                job_page_url="https://example.com/careers",
+                job_title="Engineer",
+                evidence="Engineer",
+                steps=1,
+            ),
+            error=None,
+            metadata=TaskMetadata(duration_ms=1),
+        )
+
+    monkeypatch.setattr("job_page_finder.evaluation._default_run_task", fake_run_task)
+    assert (
+        main(
+            [
+                "evaluate",
+                "run",
+                "--dataset",
+                str(dataset),
+                "--run-id",
+                "baseline",
+            ]
+        )
+        == EXIT_SUCCESS
+    )
+    parse_stdout(capsys)
+
+    run_root = dataset.parent / "runs" / "baseline"
+    assert (run_root / "results.jsonl").is_file()
+    assert (run_root / "results.manifest.json").is_file()
+    assert (run_root / "results.lock.json").is_file()
+    assert captured["config"].diagnostics_level == "diagnostic"
+    assert captured["config"].diagnostics_root == run_root / "diagnostics-diagnostic"
+
+
+@pytest.mark.parametrize("run_id", ["../escape", "nested/run", "/tmp/absolute", ".."])
+def test_evaluate_run_rejects_unsafe_run_id(monkeypatch, capsys, tmp_path: Path, run_id: str) -> None:
+    called = False
+
+    async def fake_run(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr("job_page_finder.cli.run_evaluation", fake_run)
+    assert (
+        main(
+            [
+                "evaluate",
+                "run",
+                "--dataset",
+                str(tmp_path / "cases.jsonl"),
+                "--run-id",
+                run_id,
+            ]
+        )
+        == EXIT_INVALID_INPUT
+    )
+    payload, _ = parse_stdout(capsys)
+
+    assert payload["error"]["code"] == "INVALID_EVALUATION"
+    assert not called
+
+
+def test_evaluate_reports_invalid_input_as_json(monkeypatch, capsys, tmp_path: Path) -> None:
+    from job_page_finder.evaluation import EvaluationError
+
+    def fail(*args, **kwargs):
+        raise EvaluationError("database missing")
+
+    monkeypatch.setattr("job_page_finder.cli.generate_corpweb_dataset", fail)
+    assert (
+        main(
+            [
+                "evaluate",
+                "generate",
+                "--db",
+                str(tmp_path / "missing.sqlite3"),
+                "--output",
+                str(tmp_path / "cases.jsonl"),
+            ]
+        )
+        == EXIT_INVALID_INPUT
+    )
+    payload, _ = parse_stdout(capsys)
+    assert payload["error"] == {"code": "INVALID_EVALUATION", "message": "database missing"}
