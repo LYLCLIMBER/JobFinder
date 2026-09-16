@@ -5,7 +5,9 @@ import pytest
 from pydantic import ValidationError
 
 from job_page_finder.models import JobPageFinderInput, JobPageFinderResult
-from job_page_finder.runner import TaskRequest, TaskRunner
+from job_page_finder.runner import TaskRequest as FacadeTaskRequest
+from job_page_finder.runner import TaskRunner
+from job_page_finder.task_protocol import TaskRequest
 
 
 def success_result() -> JobPageFinderResult:
@@ -26,6 +28,10 @@ def valid_request(**overrides) -> dict:
     }
     request.update(overrides)
     return request
+
+
+def test_runner_facade_reexports_task_protocol_dto() -> None:
+    assert FacadeTaskRequest is TaskRequest
 
 
 @pytest.mark.asyncio
@@ -56,7 +62,7 @@ async def test_run_returns_unified_success_result() -> None:
 @pytest.mark.asyncio
 async def test_generates_task_id_when_missing_and_preserves_provided_id(caplog) -> None:
     """Generate a non-empty task ID or keep the caller-provided value in the result and logs."""
-    caplog.set_level(logging.INFO, logger="job_page_finder.runner")
+    caplog.set_level(logging.INFO, logger="job_page_finder.application")
 
     async def fake_find(finder_input: JobPageFinderInput) -> JobPageFinderResult:
         return success_result()
@@ -145,6 +151,38 @@ async def test_maps_finder_error_code_without_parsing_message() -> None:
 
 
 @pytest.mark.asyncio
+async def test_legacy_executor_result_preserves_root_url_and_steps() -> None:
+    async def fake_find(finder_input: JobPageFinderInput) -> JobPageFinderResult:
+        return JobPageFinderResult(
+            success=True,
+            job_page_url="https://example.com",
+            job_title="Engineer",
+            evidence="Engineer",
+            steps=-1,
+        )
+
+    result = await TaskRunner(fake_find).run(valid_request())
+
+    assert result.status == "succeeded"
+    assert result.output is not None
+    assert result.output.job_page_url == "https://example.com"
+    assert result.output.steps == -1
+
+
+@pytest.mark.asyncio
+async def test_legacy_failure_without_code_keeps_message_as_internal_error() -> None:
+    async def fake_find(finder_input: JobPageFinderInput) -> JobPageFinderResult:
+        return JobPageFinderResult(success=False, error="specific failure", steps=1)
+
+    result = await TaskRunner(fake_find).run(valid_request())
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert result.error.code == "INTERNAL_ERROR"
+    assert result.error.message == "specific failure"
+
+
+@pytest.mark.asyncio
 async def test_unhandled_exception_becomes_internal_error_without_traceback() -> None:
     """Normalize unexpected exceptions to INTERNAL_ERROR without exposing a traceback."""
 
@@ -165,7 +203,7 @@ async def test_unhandled_exception_becomes_internal_error_without_traceback() ->
 @pytest.mark.asyncio
 async def test_logs_task_metadata_without_sensitive_fields(caplog) -> None:
     """Include task identity and status in logs without secrets or large page payloads."""
-    caplog.set_level(logging.INFO, logger="job_page_finder.runner")
+    caplog.set_level(logging.INFO, logger="job_page_finder.application")
 
     async def fake_find(finder_input: JobPageFinderInput) -> JobPageFinderResult:
         return success_result()

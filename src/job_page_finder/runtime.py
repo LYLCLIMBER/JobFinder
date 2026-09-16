@@ -1,4 +1,3 @@
-import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Literal
@@ -7,24 +6,24 @@ from browser_use import BrowserSession, Tools
 from browser_use.llm.base import BaseChatModel
 from pydantic import BaseModel, ConfigDict, Field
 
+from job_page_finder.adapters.browser_use.gateway import BrowserUseFactory
+from job_page_finder.adapters.diagnostics import FileDiagnosticsFactory
+from job_page_finder.adapters.models.browser_use_chat import BrowserUseChatActionModel
+from job_page_finder.application import TaskApplication
 from job_page_finder.config import create_deepseek_llm
-from job_page_finder.diagnostics import DiagnosticWriter
+from job_page_finder.diagnostic_event_bridge import current_finder_event_sink
 from job_page_finder.finder import JobPageFinder
-from job_page_finder.runner import (
-    TaskRequest,
-    TaskResult,
-    TaskRunner,
-    _elapsed_ms,
-    _exception_message,
-    _InvalidTaskError,
-    _UnsupportedTaskTypeError,
-    build_failed_result,
-    log_task_finished,
-    log_task_started,
-    request_identity,
+from job_page_finder.ports import ActionModel, BrowserFactory, DiagnosticsFactory
+from job_page_finder.runner import TaskRunner, request_identity
+from job_page_finder.settings import (
+    DEFAULT_DIAGNOSTICS_ROOT,
+    BrowserSettings,
+    DiagnosticsSettings,
+    DiagnosticsStoragePolicy,
+    FinderSettings,
+    RuntimeSettings,
 )
-
-DEFAULT_DIAGNOSTICS_ROOT = Path("log/diagnostics")
+from job_page_finder.task_protocol import TaskRequest, TaskResult
 
 
 class RuntimeConfig(BaseModel):
@@ -45,6 +44,126 @@ class RuntimeConfig(BaseModel):
     diagnostics_max_total_bytes: int = Field(default=5 * 1024 * 1024 * 1024, ge=1)
 
 
+class _RuntimeFinderProvider:
+    def __init__(
+        self,
+        settings: RuntimeSettings,
+        *,
+        browser_factory: BrowserFactory | None = None,
+        action_model: ActionModel | None = None,
+        session_factory: Callable[[], BrowserSession] | None = None,
+        tools: Tools | None = None,
+        llm: BaseChatModel | None = None,
+        finder: JobPageFinder | None = None,
+        env_file: str | Path | None = None,
+    ) -> None:
+        self._settings = settings
+        self._injected_browser_factory = browser_factory
+        self._injected_action_model = action_model
+        self._session_factory = session_factory
+        self._tools = tools
+        self._llm = llm
+        self._finder = finder
+        self._env_file = env_file
+
+    def get(self) -> JobPageFinder:
+        if self._finder is not None:
+            return self._finder
+        action_model = self._injected_action_model
+        if action_model is None:
+            llm = self._llm if self._llm is not None else create_deepseek_llm(env_file=self._env_file)
+            action_model = BrowserUseChatActionModel(
+                llm,
+                max_dom_characters=self._settings.browser.max_dom_characters,
+            )
+        browser_factory = self._injected_browser_factory
+        if browser_factory is None:
+            browser_factory = BrowserUseFactory(
+                browser_factory=self._session_factory,
+                tools=self._tools,
+                max_dom_characters=self._settings.browser.max_dom_characters,
+                max_visual_candidates=self._settings.browser.max_visual_candidates,
+                close_timeout=self._settings.finder.startup_timeout,
+                scroll_route_timeout=self._settings.browser.scroll_route_timeout,
+                scroll_route_poll_interval=self._settings.browser.scroll_route_poll_interval,
+            )
+        self._finder = JobPageFinder(
+            browser_factory,
+            action_model,
+            settings=self._settings.finder,
+            events_factory=current_finder_event_sink,
+        )
+        return self._finder
+
+
+def settings_from_config(config: RuntimeConfig | None = None) -> RuntimeSettings:
+    runtime_config = config or RuntimeConfig()
+    return RuntimeSettings(
+        finder=FinderSettings(
+            step_timeout=runtime_config.step_timeout,
+            startup_timeout=runtime_config.startup_timeout,
+            max_consecutive_failures=runtime_config.max_consecutive_failures,
+            use_vision=runtime_config.use_vision,
+        ),
+        browser=BrowserSettings(
+            max_dom_characters=runtime_config.max_dom_characters,
+            max_visual_candidates=runtime_config.max_visual_candidates,
+        ),
+        diagnostics=DiagnosticsSettings(
+            root=runtime_config.diagnostics_root,
+            storage=DiagnosticsStoragePolicy(
+                max_runs=runtime_config.diagnostics_max_runs,
+                retention_days=runtime_config.diagnostics_retention_days,
+                max_run_bytes=runtime_config.diagnostics_max_run_bytes,
+                max_total_bytes=runtime_config.diagnostics_max_total_bytes,
+            ),
+            level=runtime_config.diagnostics_level,
+            capture_screenshots=runtime_config.diagnostics_screenshots,
+        ),
+    )
+
+
+def _diagnostics_factory(settings: DiagnosticsSettings) -> DiagnosticsFactory:
+    return FileDiagnosticsFactory(
+        root=settings.root,
+        level=settings.level,
+        capture_screenshots=settings.capture_screenshots,
+        max_runs=settings.storage.max_runs,
+        retention_days=settings.storage.retention_days,
+        max_run_bytes=settings.storage.max_run_bytes,
+        max_total_bytes=settings.storage.max_total_bytes,
+    )
+
+
+def build_application(
+    settings: RuntimeSettings | None = None,
+    *,
+    browser_factory: BrowserFactory | None = None,
+    action_model: ActionModel | None = None,
+    diagnostics_factory: DiagnosticsFactory | None = None,
+    env_file: str | Path | None = None,
+    session_factory: Callable[[], BrowserSession] | None = None,
+    tools: Tools | None = None,
+    llm: BaseChatModel | None = None,
+    finder: JobPageFinder | None = None,
+) -> TaskApplication:
+    runtime_settings = settings or RuntimeSettings()
+    provider = _RuntimeFinderProvider(
+        runtime_settings,
+        browser_factory=browser_factory,
+        action_model=action_model,
+        session_factory=session_factory,
+        tools=tools,
+        llm=llm,
+        finder=finder,
+        env_file=env_file,
+    )
+    return TaskApplication(
+        provider,
+        diagnostics_factory or _diagnostics_factory(runtime_settings.diagnostics),
+    )
+
+
 def create_runner(
     *,
     config: RuntimeConfig | None = None,
@@ -54,22 +173,15 @@ def create_runner(
     finder: JobPageFinder | None = None,
     env_file: str | Path | None = None,
 ) -> TaskRunner:
-    runtime_config = config or RuntimeConfig()
-    if finder is None:
-        if llm is None:
-            llm = create_deepseek_llm(env_file=env_file)
-        finder = JobPageFinder(
-            llm=llm,
-            browser_factory=browser_factory,
-            tools=tools,
-            max_consecutive_failures=runtime_config.max_consecutive_failures,
-            step_timeout=runtime_config.step_timeout,
-            startup_timeout=runtime_config.startup_timeout,
-            max_dom_characters=runtime_config.max_dom_characters,
-            use_vision=runtime_config.use_vision,
-            max_visual_candidates=runtime_config.max_visual_candidates,
-        )
-    return TaskRunner(finder)
+    application = build_application(
+        settings_from_config(config),
+        session_factory=browser_factory,
+        tools=tools,
+        llm=llm,
+        finder=finder,
+        env_file=env_file,
+    )
+    return TaskRunner(application=application)
 
 
 async def run_task(
@@ -83,73 +195,17 @@ async def run_task(
     finder: JobPageFinder | None = None,
     env_file: str | Path | None = None,
 ) -> TaskResult:
-    started = time.perf_counter()
-    task_id, task_type = request_identity(request)
-    runtime_config = config or RuntimeConfig()
-    capture_screenshots = (
-        runtime_config.diagnostics_screenshots
-        if runtime_config.diagnostics_screenshots is not None
-        else runtime_config.diagnostics_level in {"diagnostic", "raw"}
+    if runner is not None:
+        settings = settings_from_config(config)
+        task_id, task_type = request_identity(request)
+        diagnostics = _diagnostics_factory(settings.diagnostics).create(task_id=task_id, task_type=task_type)
+        return await runner.run(request, diagnostics=diagnostics)
+    application = build_application(
+        settings_from_config(config),
+        session_factory=browser_factory,
+        tools=tools,
+        llm=llm,
+        finder=finder,
+        env_file=env_file,
     )
-    diagnostics = DiagnosticWriter(
-        root=runtime_config.diagnostics_root,
-        level=runtime_config.diagnostics_level,
-        task_id=task_id,
-        task_type=task_type,
-        capture_screenshots=capture_screenshots,
-        max_runs=runtime_config.diagnostics_max_runs,
-        retention_days=runtime_config.diagnostics_retention_days,
-        max_run_bytes=runtime_config.diagnostics_max_run_bytes,
-        max_total_bytes=runtime_config.diagnostics_max_total_bytes,
-    )
-    log_task_started(task_id, task_type)
-    try:
-        parsed = TaskRunner.parse_request(request)
-    except _UnsupportedTaskTypeError as exc:
-        result = build_failed_result(
-            task_id=task_id,
-            task_type=exc.task_type,
-            code="UNSUPPORTED_TASK_TYPE",
-            message=str(exc),
-            duration_ms=_elapsed_ms(started),
-        )
-        log_task_finished(result)
-        diagnostics.finish(result.model_dump(mode="json"))
-        return result
-    except _InvalidTaskError as exc:
-        result = build_failed_result(
-            task_id=task_id,
-            task_type=task_type,
-            code="INVALID_TASK",
-            message=str(exc),
-            duration_ms=_elapsed_ms(started),
-        )
-        log_task_finished(result)
-        diagnostics.finish(result.model_dump(mode="json"))
-        return result
-
-    if parsed.task_id != task_id:
-        parsed = parsed.model_copy(update={"task_id": task_id})
-
-    if runner is None:
-        try:
-            runner = create_runner(
-                config=runtime_config,
-                llm=llm,
-                tools=tools,
-                browser_factory=browser_factory,
-                finder=finder,
-                env_file=env_file,
-            )
-        except Exception as exc:
-            result = build_failed_result(
-                task_id=task_id,
-                task_type=parsed.type,
-                code="CONFIGURATION_ERROR",
-                message=_exception_message(exc),
-                duration_ms=_elapsed_ms(started),
-            )
-            log_task_finished(result)
-            diagnostics.finish(result.model_dump(mode="json"))
-            return result
-    return await runner.run(parsed, emit_started=False, diagnostics=diagnostics)
+    return await application.run(request)

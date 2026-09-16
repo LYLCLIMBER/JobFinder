@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from job_page_finder.scrolling import discover_scroll_targets, targets_for_direction
+from job_page_finder.adapters.browser_use.scroll_targets import discover_scroll_targets, targets_for_direction
 
 
 class Node:

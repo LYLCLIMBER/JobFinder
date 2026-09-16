@@ -1,4 +1,6 @@
+import io
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -10,21 +12,50 @@ from job_page_finder.cli import (
     EXIT_TASK_FAILED,
     main,
 )
+from job_page_finder.cli import _iter_jsonl_lines as _iter_jsonl_lines
+from job_page_finder.contracts import (
+    FindJobPageFailure,
+    FindJobPageRequest,
+    FindJobPageResult,
+    FindJobPageSuccess,
+    JobEvidence,
+)
 from job_page_finder.evaluation import EvaluationCase
-from job_page_finder.models import JobPageFinderInput, JobPageFinderResult
-from job_page_finder.runner import FindJobPageOutput, TaskMetadata, TaskResult, TaskRunner
+from job_page_finder.runtime import RuntimeConfig
+from job_page_finder.task_protocol import FindJobPageTaskOutput as FindJobPageOutput
+from job_page_finder.task_protocol import TaskMetadata, TaskResult
 
 
-def install_fake_finder(monkeypatch, result: JobPageFinderResult | Exception):
-    async def fake_find(finder_input: JobPageFinderInput) -> JobPageFinderResult:
+def succeeded_result(*, job_page_url: str, job_title: str, evidence: str, steps: int) -> FindJobPageSuccess:
+    return FindJobPageSuccess(
+        status="succeeded",
+        job_page_url=job_page_url,
+        job_title=job_title,
+        evidence=JobEvidence(quote=evidence, source_url=job_page_url),
+        steps=steps,
+    )
+
+
+def failed_result(*, code: str, message: str, steps: int) -> FindJobPageFailure:
+    return FindJobPageFailure(status="failed", code=code, message=message, retryable=True, steps=steps)
+
+
+def install_fake_finder(monkeypatch, result: FindJobPageResult | Exception):
+    async def fake_find(finder_input: FindJobPageRequest) -> FindJobPageResult:
         if isinstance(result, Exception):
             raise result
         return result
 
-    monkeypatch.setattr(
-        "job_page_finder.runtime.create_runner",
-        lambda **kwargs: TaskRunner(fake_find),
-    )
+    class Finder:
+        async def find(self, finder_input: FindJobPageRequest, *, events: object = None) -> FindJobPageResult:
+            return await fake_find(finder_input)
+
+    def fake_build(settings=None, **kwargs):
+        from job_page_finder.runtime import build_application
+
+        return build_application(settings, finder=Finder(), **kwargs)
+
+    monkeypatch.setattr("job_page_finder.cli.build_application", fake_build)
 
 
 def parse_stdout(capsys) -> tuple[dict, str]:
@@ -32,12 +63,34 @@ def parse_stdout(capsys) -> tuple[dict, str]:
     return json.loads(captured.out), captured.err
 
 
-def test_find_job_page_shortcut_prints_json_and_exits_zero(monkeypatch, capsys) -> None:
-    """Accept find-job-page arguments and print a succeeded JSON result."""
+def write_task(
+    tmp_path: Path,
+    *,
+    company_url: str = "https://example.com",
+    max_steps: int = 8,
+    task_id: str = "cli-task",
+) -> str:
+    path = tmp_path / "task.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "version": "v1",
+                "task_id": task_id,
+                "type": "find_job_page",
+                "payload": {"company_url": company_url, "max_steps": max_steps},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+def test_run_prints_json_and_exits_zero(monkeypatch, capsys, tmp_path: Path) -> None:
+    """Accept JSONL run input and print a succeeded JSON result."""
     install_fake_finder(
         monkeypatch,
-        JobPageFinderResult(
-            success=True,
+        succeeded_result(
             job_page_url="https://example.com/careers",
             job_title="Senior Backend Engineer",
             evidence="Senior Backend Engineer",
@@ -45,7 +98,7 @@ def test_find_job_page_shortcut_prints_json_and_exits_zero(monkeypatch, capsys) 
         ),
     )
 
-    exit_code = main(["find-job-page", "https://example.com", "--max-steps", "4"])
+    exit_code = main(["run", write_task(tmp_path, max_steps=4)])
     payload, stderr = parse_stdout(capsys)
 
     assert exit_code == EXIT_SUCCESS
@@ -57,11 +110,12 @@ def test_find_job_page_shortcut_prints_json_and_exits_zero(monkeypatch, capsys) 
     assert not stderr or "task_id=" in stderr
 
 
-def test_cli_default_diagnostics_root_uses_test_tmp_path(monkeypatch, capsys, isolate_default_diagnostics_root) -> None:
+def test_cli_default_diagnostics_root_uses_test_tmp_path(
+    monkeypatch, capsys, tmp_path: Path, isolate_default_diagnostics_root
+) -> None:
     install_fake_finder(
         monkeypatch,
-        JobPageFinderResult(
-            success=True,
+        succeeded_result(
             job_page_url="https://example.com/careers",
             job_title="Senior Backend Engineer",
             evidence="Senior Backend Engineer",
@@ -69,7 +123,7 @@ def test_cli_default_diagnostics_root_uses_test_tmp_path(monkeypatch, capsys, is
         ),
     )
 
-    assert main(["find-job-page", "https://example.com"]) == EXIT_SUCCESS
+    assert main(["run", write_task(tmp_path)]) == EXIT_SUCCESS
     parse_stdout(capsys)
     assert len([path for path in isolate_default_diagnostics_root.iterdir() if path.is_dir()]) == 1
 
@@ -78,8 +132,7 @@ def test_run_json_file_uses_the_same_result_contract(monkeypatch, capsys, tmp_pa
     """Read a JSON task file and print the same unified result envelope."""
     install_fake_finder(
         monkeypatch,
-        JobPageFinderResult(
-            success=True,
+        succeeded_result(
             job_page_url="https://example.com/careers",
             job_title="Senior Backend Engineer",
             evidence="Senior Backend Engineer",
@@ -127,7 +180,7 @@ def test_unknown_task_type_exits_nonzero(monkeypatch, capsys, tmp_path: Path) ->
     """Map an unknown task type to a structured CLI failure."""
     install_fake_finder(
         monkeypatch,
-        JobPageFinderResult(success=True, job_page_url="x", job_title="x", evidence="x", steps=1),
+        succeeded_result(job_page_url="https://example.com/x", job_title="x", evidence="x", steps=1),
     )
     task_file = tmp_path / "unknown.json"
     task_file.write_text(
@@ -142,19 +195,16 @@ def test_unknown_task_type_exits_nonzero(monkeypatch, capsys, tmp_path: Path) ->
     assert payload["error"]["code"] == "UNSUPPORTED_TASK_TYPE"
 
 
-def test_task_failure_uses_exit_code_one(monkeypatch, capsys) -> None:
+def test_task_failure_uses_exit_code_one(monkeypatch, capsys, tmp_path: Path) -> None:
     """Use a non-zero task failure exit code when the finder returns a domain error."""
     install_fake_finder(
         monkeypatch,
-        JobPageFinderResult(
-            success=False,
-            steps=8,
-            error="Maximum steps reached without finding a specific job",
-            error_code="MAX_STEPS_REACHED",
+        failed_result(
+            code="MAX_STEPS_REACHED", message="Maximum steps reached without finding a specific job", steps=8
         ),
     )
 
-    exit_code = main(["find-job-page", "https://example.com"])
+    exit_code = main(["run", write_task(tmp_path)])
     payload, _ = parse_stdout(capsys)
 
     assert exit_code == EXIT_TASK_FAILED
@@ -163,14 +213,14 @@ def test_task_failure_uses_exit_code_one(monkeypatch, capsys) -> None:
     assert payload["output"] is None
 
 
-def test_configuration_error_uses_exit_code_three(monkeypatch, capsys) -> None:
+def test_configuration_error_uses_exit_code_three(monkeypatch, capsys, tmp_path: Path) -> None:
     """Surface composition failures as CONFIGURATION_ERROR with a dedicated exit code."""
 
     def boom(**kwargs):
         raise RuntimeError("DEEPSEEK_API_KEY is not configured")
 
-    monkeypatch.setattr("job_page_finder.runtime.create_runner", boom)
-    exit_code = main(["find-job-page", "https://example.com"])
+    monkeypatch.setattr("job_page_finder.runtime.create_deepseek_llm", boom)
+    exit_code = main(["run", write_task(tmp_path)])
     payload, _ = parse_stdout(capsys)
 
     assert exit_code == EXIT_CONFIGURATION_ERROR
@@ -191,14 +241,14 @@ def test_unreadable_task_file_exits_nonzero_with_structured_error(monkeypatch, c
 
     blocked = tmp_path / "blocked.json"
     blocked.write_text("{}", encoding="utf-8")
-    original = Path.read_text
+    original_open = Path.open
 
-    def fake_read_text(self, *args, **kwargs):
+    def fake_open(self, *args, **kwargs):
         if self == blocked:
             raise PermissionError("denied")
-        return original(self, *args, **kwargs)
+        return original_open(self, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_text", fake_read_text)
+    monkeypatch.setattr(Path, "open", fake_open)
     exit_code = main(["run", str(blocked)])
     payload, stderr = parse_stdout(capsys)
 
@@ -208,14 +258,14 @@ def test_unreadable_task_file_exits_nonzero_with_structured_error(monkeypatch, c
     assert "Traceback" not in stderr
 
 
-def test_invalid_shortcut_is_not_masked_by_configuration_error(monkeypatch, capsys) -> None:
+def test_invalid_payload_is_not_masked_by_configuration_error(monkeypatch, capsys, tmp_path: Path) -> None:
     """Reject illegal CLI payload before composition so the exit code stays 2."""
 
     def boom(**kwargs):
         raise RuntimeError("DEEPSEEK_API_KEY is not configured")
 
-    monkeypatch.setattr("job_page_finder.runtime.create_runner", boom)
-    exit_code = main(["find-job-page", "not-a-url"])
+    monkeypatch.setattr("job_page_finder.runtime.create_deepseek_llm", boom)
+    exit_code = main(["run", write_task(tmp_path, company_url="not-a-url")])
     payload, _ = parse_stdout(capsys)
 
     assert exit_code == EXIT_INVALID_INPUT
@@ -230,6 +280,126 @@ def test_usage_error_prints_json_on_stdout(capsys) -> None:
     assert exit_code == EXIT_INVALID_INPUT
     assert payload["error"]["code"] == "INVALID_TASK"
     assert payload["status"] == "failed"
+
+
+def _task_line(task_id: str) -> str:
+    return json.dumps(
+        {
+            "version": "v1",
+            "task_id": task_id,
+            "type": "find_job_page",
+            "payload": {"company_url": "https://example.com"},
+        }
+    )
+
+
+def test_run_jsonl_emits_one_result_per_nonempty_line(monkeypatch, capsys, tmp_path: Path) -> None:
+    install_fake_finder(
+        monkeypatch,
+        succeeded_result(
+            job_page_url="https://example.com/careers", job_title="Engineer", evidence="Engineer", steps=1
+        ),
+    )
+    task_file = tmp_path / "tasks.jsonl"
+    task_file.write_text("\n".join(["", _task_line("one"), "", _task_line("two"), ""]) + "\n", encoding="utf-8")
+
+    exit_code = main(["run", str(task_file)])
+    captured = capsys.readouterr()
+    lines = [json.loads(line) for line in captured.out.splitlines() if line.strip()]
+
+    assert exit_code == EXIT_SUCCESS
+    assert [line["task_id"] for line in lines] == ["one", "two"]
+    assert all(line["status"] == "succeeded" for line in lines)
+
+
+def test_run_jsonl_continues_after_invalid_lines(monkeypatch, capsys, tmp_path: Path) -> None:
+    install_fake_finder(
+        monkeypatch,
+        succeeded_result(
+            job_page_url="https://example.com/careers", job_title="Engineer", evidence="Engineer", steps=1
+        ),
+    )
+    task_file = tmp_path / "mixed.jsonl"
+    task_file.write_text(
+        "\n".join(["{not json", _task_line("ok"), "[]", _task_line("still-ok")]) + "\n",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["run", str(task_file)])
+    captured = capsys.readouterr()
+    lines = [json.loads(line) for line in captured.out.splitlines() if line.strip()]
+
+    assert exit_code == EXIT_INVALID_INPUT
+    assert len(lines) == 4
+    assert lines[0]["error"]["code"] == "INVALID_TASK"
+    assert lines[1]["task_id"] == "ok"
+    assert lines[2]["error"]["code"] == "INVALID_TASK"
+    assert lines[3]["task_id"] == "still-ok"
+
+
+def test_run_reads_stdin_and_dash(monkeypatch, capsys) -> None:
+    install_fake_finder(
+        monkeypatch,
+        succeeded_result(
+            job_page_url="https://example.com/careers", job_title="Engineer", evidence="Engineer", steps=1
+        ),
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO(_task_line("stdin-task") + "\n"))
+    exit_code = main(["run"])
+    captured = capsys.readouterr()
+    lines = [json.loads(line) for line in captured.out.splitlines() if line.strip()]
+    assert exit_code == EXIT_SUCCESS
+    assert lines[0]["task_id"] == "stdin-task"
+
+    monkeypatch.setattr(sys, "stdin", io.StringIO(_task_line("dash-task") + "\n"))
+    exit_code = main(["run", "-"])
+    captured = capsys.readouterr()
+    lines = [json.loads(line) for line in captured.out.splitlines() if line.strip()]
+    assert exit_code == EXIT_SUCCESS
+    assert lines[0]["task_id"] == "dash-task"
+
+
+def test_stdin_read_errors_are_structured_invalid_tasks(monkeypatch) -> None:
+    class BrokenInput:
+        def __iter__(self):
+            raise UnicodeDecodeError("utf-8", b"\\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(sys, "stdin", BrokenInput())
+    values = list(_iter_jsonl_lines(None))
+
+    assert len(values) == 1
+    assert isinstance(values[0], TaskResult)
+    assert values[0].error is not None and values[0].error.code == "INVALID_TASK"
+
+
+def test_run_jsonl_mixed_task_failure_uses_exit_code_one(monkeypatch, capsys, tmp_path: Path) -> None:
+    calls = {"n": 0}
+
+    async def fake_find(finder_input: FindJobPageRequest) -> FindJobPageResult:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return succeeded_result(
+                job_page_url="https://example.com/careers", job_title="Engineer", evidence="Engineer", steps=1
+            )
+        return failed_result(code="MAX_STEPS_REACHED", message="failed", steps=1)
+
+    class Finder:
+        async def find(self, finder_input: FindJobPageRequest, *, events: object = None) -> FindJobPageResult:
+            return await fake_find(finder_input)
+
+    def fake_build(settings=None, **kwargs):
+        from job_page_finder.runtime import build_application
+
+        return build_application(settings, finder=Finder(), **kwargs)
+
+    monkeypatch.setattr("job_page_finder.cli.build_application", fake_build)
+    task_file = tmp_path / "mixed.jsonl"
+    task_file.write_text(_task_line("ok") + "\n" + _task_line("fail") + "\n", encoding="utf-8")
+
+    exit_code = main(["run", str(task_file)])
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert exit_code == EXIT_TASK_FAILED
+    assert [line["status"] for line in lines] == ["succeeded", "failed"]
 
 
 def test_evaluate_generate_prints_manifest(monkeypatch, capsys, tmp_path: Path) -> None:
@@ -340,24 +510,31 @@ def test_evaluate_run_creates_default_sidecars(monkeypatch, capsys, tmp_path: Pa
     )
     dataset.write_text(case.model_dump_json() + "\n", encoding="utf-8")
 
-    async def fake_run_task(request, config):
-        captured["config"] = config
-        return TaskResult(
-            version="v1",
-            task_id=request["task_id"],
-            type="find_job_page",
-            status="succeeded",
-            output=FindJobPageOutput(
-                job_page_url="https://example.com/careers",
-                job_title="Engineer",
-                evidence="Engineer",
-                steps=1,
-            ),
-            error=None,
-            metadata=TaskMetadata(duration_ms=1),
-        )
+    class Application:
+        async def run(self, request):
+            return TaskResult(
+                version="v1",
+                task_id=request["task_id"],
+                type="find_job_page",
+                status="succeeded",
+                output=FindJobPageOutput(
+                    job_page_url="https://example.com/careers",
+                    job_title="Engineer",
+                    evidence="Engineer",
+                    steps=1,
+                ),
+                error=None,
+                metadata=TaskMetadata(duration_ms=1),
+            )
 
-    monkeypatch.setattr("job_page_finder.evaluation._default_run_task", fake_run_task)
+    def fake_build(settings, **kwargs):
+        captured["config"] = RuntimeConfig(
+            diagnostics_level=settings.diagnostics.level,
+            diagnostics_root=settings.diagnostics.root,
+        )
+        return Application()
+
+    monkeypatch.setattr("job_page_finder.evaluation._impl.build_application", fake_build)
     assert (
         main(
             [

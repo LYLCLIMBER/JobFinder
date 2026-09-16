@@ -2,7 +2,7 @@
 .ruff_cache/
 .log/
 *.log
-evaluation/
+/evaluation/
 log/
 .venv/
 __pycache__/

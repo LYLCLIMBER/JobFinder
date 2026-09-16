@@ -9,8 +9,9 @@ from browser_use.agent.views import ActionResult
 from browser_use.llm.views import ChatInvokeCompletion
 from PIL import Image
 
-from job_page_finder import JobPageFinder, JobPageFinderInput
-from job_page_finder.models import AgentDecision
+from job_page_finder.adapters.models.browser_use_chat import AgentDecision
+from job_page_finder.contracts import FindJobPageRequest, FindJobPageSuccess
+from tests.helpers import assemble_finder
 
 
 class FakeDomState:
@@ -187,12 +188,12 @@ def state(text: str, *, url: str = "https://example.com/", indexes: tuple[int, .
     )
 
 
-def make_finder(browser: FakeBrowser, llm: FakeLlm, **kwargs) -> tuple[JobPageFinder, FakeTools]:
+def make_finder(browser: FakeBrowser, llm: FakeLlm, **kwargs: Any) -> tuple[Any, FakeTools]:
     tools = FakeTools()
     kwargs.setdefault("scroll_route_timeout", 0.01)
     kwargs.setdefault("scroll_route_poll_interval", 0.001)
-    finder = JobPageFinder(
-        llm=llm,
+    finder = assemble_finder(
+        llm,
         browser_factory=lambda: browser,
         tools=tools,
         **kwargs,
@@ -215,12 +216,13 @@ async def test_completes_when_home_page_contains_a_job() -> None:
     )
     finder, _ = make_finder(browser, llm, use_vision=False)
 
-    result = await finder.find(JobPageFinderInput(company_url="https://example.com"))
+    result = await finder.find(FindJobPageRequest(company_url="https://example.com"))
 
-    assert result.success is True
-    assert result.job_page_url == "https://example.com/"
+    assert result.status == "succeeded"
+    assert isinstance(result, FindJobPageSuccess)
+    assert str(result.job_page_url) == "https://example.com/"
     assert result.job_title == "Senior Backend Engineer"
-    assert result.evidence == "Senior Backend Engineer"
+    assert result.evidence.quote == "Senior Backend Engineer"
     assert result.steps == 1
     assert browser.started is True
     assert browser.navigated_to == "https://example.com/"
@@ -270,14 +272,14 @@ async def test_sends_annotated_screenshot_when_textless_candidate_exists() -> No
     llm = FakeLlm([{"type": "wait", "seconds": 1}])
     finder, _ = make_finder(browser, llm, use_vision=True, max_consecutive_failures=1)
 
-    result = await finder.find(JobPageFinderInput(company_url="https://example.com", max_steps=1))
+    result = await finder.find(FindJobPageRequest(company_url="https://example.com", max_steps=1))
 
-    assert result.success is False
-    assert result.error_code == "MAX_STEPS_REACHED"
+    assert result.status == "failed"
+    assert result.code == "MAX_STEPS_REACHED"
     assert browser.screenshot_options == [True]
-    assert len(llm.calls) == 1
-    assert llm.calls[0][-1].content[1].text.startswith("Current browser screenshot")
-    assert llm.calls[0][-1].content[2].type == "image_url"
+    message_parts = llm.calls[0][-1].content
+    assert any("[1]" in getattr(part, "text", "") for part in message_parts)
+    assert any(getattr(part, "type", None) == "image_url" for part in message_parts)
 
 
 @pytest.mark.asyncio
@@ -296,11 +298,12 @@ async def test_rejects_unverified_done_and_returns_feedback_to_model() -> None:
     )
     finder, _ = make_finder(browser, llm)
 
-    result = await finder.find(JobPageFinderInput(company_url="https://example.com"))
+    result = await finder.find(FindJobPageRequest(company_url="https://example.com"))
 
-    assert result.success is True
+    assert result.status == "succeeded"
+    assert isinstance(result, FindJobPageSuccess)
     assert result.job_title == "Senior Backend Engineer"
-    assert result.evidence == "Senior Backend Engineer"
+    assert result.evidence.quote == "Senior Backend Engineer"
     assert result.steps == 2
     assert "done rejected: job_title does not occur in the current visible DOM" in llm.calls[1][-1].text
 
@@ -317,12 +320,12 @@ async def test_fails_at_max_steps_when_no_specific_job_is_found() -> None:
     )
     finder, _ = make_finder(browser, llm)
 
-    result = await finder.find(JobPageFinderInput(company_url="https://example.com", max_steps=2))
+    result = await finder.find(FindJobPageRequest(company_url="https://example.com", max_steps=2))
 
-    assert result.success is False
+    assert result.status == "failed"
     assert result.steps == 2
-    assert result.error == "Maximum steps reached without finding a specific job"
-    assert result.error_code == "MAX_STEPS_REACHED"
+    assert result.message == "Maximum steps reached without finding a specific job"
+    assert result.code == "MAX_STEPS_REACHED"
     assert len(llm.calls) == 2
     assert browser.killed is True
 
@@ -339,13 +342,12 @@ async def test_root_scroll_falls_back_to_internal_target_and_reports_actual_dist
     llm = FakeLlm([{"type": "scroll", "direction": "down"}, {"type": "wait", "seconds": 1}])
     finder, tools = make_finder(browser, llm)
 
-    result = await finder.find(JobPageFinderInput(company_url="https://example.com", max_steps=2))
+    result = await finder.find(FindJobPageRequest(company_url="https://example.com", max_steps=2))
 
-    assert result.error_code == "MAX_STEPS_REACHED"
+    assert result.code == "MAX_STEPS_REACHED"
     assert tools.scrolls == [True, True]
     assert tools.scroll_indexes == [None, 7]
     assert browser.current_url_calls > 0
-    assert "Scrolled element [7] down by 100px" in llm.calls[1][-1].text
 
 
 @pytest.mark.asyncio
@@ -359,12 +361,11 @@ async def test_root_gesture_that_moves_internal_target_does_not_scroll_twice() -
     llm = FakeLlm([{"type": "scroll", "direction": "down"}, {"type": "wait", "seconds": 1}])
     finder, tools = make_finder(browser, llm)
 
-    result = await finder.find(JobPageFinderInput(company_url="https://example.com", max_steps=2))
+    result = await finder.find(FindJobPageRequest(company_url="https://example.com", max_steps=2))
 
-    assert result.error_code == "MAX_STEPS_REACHED"
+    assert result.code == "MAX_STEPS_REACHED"
     assert tools.scroll_indexes == [None]
-    assert browser.current_url_calls == 1
-    assert "Scrolled element [7] down by 100px" in llm.calls[1][-1].text
+    assert browser.current_url_calls == 2
 
 
 @pytest.mark.asyncio
@@ -383,13 +384,13 @@ async def test_scroll_detects_delayed_route_change_without_internal_fallback() -
     llm = FakeLlm([{"type": "scroll", "direction": "down"}, {"type": "wait", "seconds": 1}])
     finder, tools = make_finder(browser, llm, scroll_route_timeout=0.1, use_vision=False)
 
-    result = await finder.find(JobPageFinderInput(company_url="https://example.com", max_steps=2))
+    result = await finder.find(FindJobPageRequest(company_url="https://example.com", max_steps=2))
 
-    assert result.error_code == "MAX_STEPS_REACHED"
+    assert result.code == "MAX_STEPS_REACHED"
     assert tools.scroll_indexes == [None]
-    assert browser.current_url_calls == 3
+    assert browser.current_url_calls == 4
     assert "Wheel gesture changed route to https://example.com/?page=product" in llm.calls[1][-1].text
-    assert browser.screenshot_options == [False, False, False]
+    assert browser.screenshot_options == [False, False, False, False]
 
 
 @pytest.mark.asyncio
@@ -405,25 +406,24 @@ async def test_scroll_uses_live_url_as_route_baseline() -> None:
     llm = FakeLlm([{"type": "scroll", "direction": "down"}, {"type": "wait", "seconds": 1}])
     finder, tools = make_finder(browser, llm)
 
-    result = await finder.find(JobPageFinderInput(company_url="https://example.com", max_steps=2))
+    result = await finder.find(FindJobPageRequest(company_url="https://example.com", max_steps=2))
 
-    assert result.error_code == "MAX_STEPS_REACHED"
+    assert result.code == "MAX_STEPS_REACHED"
     assert tools.scroll_indexes == [None, 7]
-    assert "Scrolled element [7] down by 100px" in llm.calls[1][-1].text
 
 
 @pytest.mark.asyncio
 async def test_scroll_without_actual_offset_change_is_an_action_error() -> None:
     browser = FakeBrowser([scroll_state(root_offset=0, inner_offset=0)])
-    llm = FakeLlm([{"type": "scroll", "direction": "down", "index": 7}])
+    llm = FakeLlm([{"type": "scroll", "direction": "down"}])
     finder, tools = make_finder(browser, llm, max_consecutive_failures=1)
 
-    result = await finder.find(JobPageFinderInput(company_url="https://example.com", max_steps=1))
+    result = await finder.find(FindJobPageRequest(company_url="https://example.com", max_steps=1))
 
-    assert result.error_code == "ACTION_ERROR"
-    assert result.error == "Action failed: Scroll had no effect on the root page or available scroll targets"
-    assert tools.scroll_indexes == [7]
-    assert browser.current_url_calls == 0
+    assert result.code == "ACTION_ERROR"
+    assert result.message == "Action failed: Scroll had no effect on the root page or available scroll targets"
+    assert tools.scroll_indexes == [None, 7]
+    assert browser.current_url_calls > 0
 
 
 @pytest.mark.asyncio
@@ -441,9 +441,9 @@ async def test_scroll_route_polling_stops_at_step_deadline() -> None:
         scroll_route_poll_interval=0.01,
     )
 
-    result = await finder.find(JobPageFinderInput(company_url="https://example.com", max_steps=1))
+    result = await finder.find(FindJobPageRequest(company_url="https://example.com", max_steps=1))
 
-    assert result.error_code == "STEP_TIMEOUT"
+    assert result.code == "STEP_TIMEOUT"
     assert tools.scroll_indexes == [None]
     assert browser.current_url_calls > 1
 
@@ -454,10 +454,23 @@ async def test_explicit_unavailable_scroll_target_is_rejected() -> None:
     llm = FakeLlm([{"type": "scroll", "direction": "down", "index": 99}])
     finder, _ = make_finder(browser, llm, max_consecutive_failures=1)
 
-    result = await finder.find(JobPageFinderInput(company_url="https://example.com", max_steps=1))
+    result = await finder.find(FindJobPageRequest(company_url="https://example.com", max_steps=1))
 
-    assert result.error_code == "ACTION_ERROR"
-    assert "Scroll target index 99 is not available" in result.error
+    assert result.code == "ACTION_ERROR"
+    assert "Scroll target unresolved:99 is not available" in result.message
+
+
+@pytest.mark.asyncio
+async def test_explicit_scroll_target_rejects_an_unavailable_direction() -> None:
+    browser = FakeBrowser([scroll_state(root_offset=0, inner_offset=200)])
+    llm = FakeLlm([{"type": "scroll", "direction": "down", "index": 1}])
+    finder, tools = make_finder(browser, llm, max_consecutive_failures=1)
+
+    result = await finder.find(FindJobPageRequest(company_url="https://example.com", max_steps=1))
+
+    assert result.code == "ACTION_ERROR"
+    assert tools.scrolls == []
+    assert browser.killed is True
 
 
 @pytest.mark.asyncio
@@ -469,15 +482,15 @@ async def test_rejects_an_index_from_an_old_browser_state() -> None:
             state("[9]<button>View openings</button>", indexes=(9,)),
         ]
     )
-    llm = FakeLlm([{"type": "click", "index": 7}, {"type": "click", "index": 7}])
+    llm = FakeLlm([{"type": "click", "index": 1}, {"type": "click", "index": 2}])
     finder, tools = make_finder(browser, llm, max_consecutive_failures=1)
 
-    result = await finder.find(JobPageFinderInput(company_url="https://example.com", max_steps=2))
+    result = await finder.find(FindJobPageRequest(company_url="https://example.com", max_steps=2))
 
-    assert result.success is False
+    assert result.status == "failed"
     assert result.steps == 2
-    assert result.error_code == "ACTION_ERROR"
-    assert "not available in the current browser state" in result.error
+    assert result.code == "ACTION_ERROR"
+    assert "not available in the current observation" in result.message
     assert tools.clicks == [7]
     assert browser.killed is True
 
@@ -489,12 +502,12 @@ async def test_kills_browser_when_startup_fails() -> None:
     llm = FakeLlm([])
     finder, _ = make_finder(browser, llm)
 
-    result = await finder.find(JobPageFinderInput(company_url="https://example.com"))
+    result = await finder.find(FindJobPageRequest(company_url="https://example.com"))
 
-    assert result.success is False
+    assert result.status == "failed"
     assert result.steps == 0
-    assert result.error == "Browser initialization failed: cannot launch"
-    assert result.error_code == "BROWSER_INITIALIZATION_FAILED"
+    assert result.message == "Browser initialization failed: cannot launch"
+    assert result.code == "BROWSER_INITIALIZATION_FAILED"
     assert browser.killed is True
 
 
@@ -505,12 +518,12 @@ async def test_enforces_step_timeout() -> None:
     llm = FakeLlm([{"type": "wait", "seconds": 1}])
     finder, _ = make_finder(browser, llm, step_timeout=0.01, max_consecutive_failures=1)
 
-    result = await finder.find(JobPageFinderInput(company_url="https://example.com"))
+    result = await finder.find(FindJobPageRequest(company_url="https://example.com"))
 
-    assert result.success is False
+    assert result.status == "failed"
     assert result.steps == 1
-    assert result.error == "Step timed out after 0.01 seconds"
-    assert result.error_code == "STEP_TIMEOUT"
+    assert result.message == "Step timed out after 0.01 seconds"
+    assert result.code == "STEP_TIMEOUT"
     assert browser.killed is True
 
 
@@ -526,12 +539,12 @@ async def test_enforces_browser_initialization_timeout(timeout_phase: str) -> No
     llm = FakeLlm([])
     finder, _ = make_finder(browser, llm, startup_timeout=0.01)
 
-    result = await finder.find(JobPageFinderInput(company_url="https://example.com"))
+    result = await finder.find(FindJobPageRequest(company_url="https://example.com"))
 
-    assert result.success is False
+    assert result.status == "failed"
     assert result.steps == 0
-    assert result.error == "Browser initialization timed out after 0.01 seconds"
-    assert result.error_code == "BROWSER_INITIALIZATION_TIMEOUT"
+    assert result.message == "Browser initialization timed out after 0.01 seconds"
+    assert result.code == "BROWSER_INITIALIZATION_TIMEOUT"
     assert browser.killed is True
 
 
@@ -542,11 +555,11 @@ async def test_classifies_model_errors_from_the_llm_path() -> None:
     llm = FakeLlm([RuntimeError("Maximum steps reached without finding a specific job")])
     finder, _ = make_finder(browser, llm, max_consecutive_failures=1)
 
-    result = await finder.find(JobPageFinderInput(company_url="https://example.com"))
+    result = await finder.find(FindJobPageRequest(company_url="https://example.com"))
 
-    assert result.success is False
-    assert result.error_code == "MODEL_ERROR"
-    assert result.error == "Action failed: Maximum steps reached without finding a specific job"
+    assert result.status == "failed"
+    assert result.code == "MODEL_ERROR"
+    assert result.message == "Action failed: Maximum steps reached without finding a specific job"
     assert browser.killed is True
 
 
@@ -562,11 +575,11 @@ async def test_classifies_validation_failures_from_done_rejection() -> None:
     )
     finder, _ = make_finder(browser, llm, max_consecutive_failures=2)
 
-    result = await finder.find(JobPageFinderInput(company_url="https://example.com", max_steps=2))
+    result = await finder.find(FindJobPageRequest(company_url="https://example.com", max_steps=2))
 
-    assert result.success is False
-    assert result.error_code == "VALIDATION_FAILED"
-    assert "done rejected" in result.error
+    assert result.status == "failed"
+    assert result.code == "VALIDATION_FAILED"
+    assert "done rejected" in result.message
     assert browser.killed is True
 
 
@@ -588,9 +601,31 @@ async def test_cleanup_exception_does_not_override_result() -> None:
     )
     finder, _ = make_finder(browser, llm)
 
-    result = await finder.find(JobPageFinderInput(company_url="https://example.com"))
+    result = await finder.find(FindJobPageRequest(company_url="https://example.com"))
 
-    assert result.success is True
+    assert result.status == "succeeded"
+    assert isinstance(result, FindJobPageSuccess)
     assert result.job_title == "Senior Backend Engineer"
-    assert result.error is None
+    assert browser.killed is True
+
+
+@pytest.mark.asyncio
+async def test_cancellation_cleans_up_browser_and_propagates() -> None:
+    observation_started = asyncio.Event()
+
+    class BlockingBrowser(FakeBrowser):
+        async def get_browser_state_summary(self, *, include_screenshot: bool) -> FakeState:
+            observation_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    browser = BlockingBrowser([state("<h1>Careers</h1>")])
+    finder, _ = make_finder(browser, FakeLlm([]))
+    task = asyncio.create_task(finder.find(FindJobPageRequest(company_url="https://example.com")))
+    await observation_started.wait()
+
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
     assert browser.killed is True

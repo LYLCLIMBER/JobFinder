@@ -2,15 +2,17 @@ import asyncio
 import errno
 import json
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
 
-import job_page_finder.evaluation as evaluation_module
+import job_page_finder.evaluation.store as evaluation_store
 from job_page_finder.evaluation import (
+    EvaluationCampaign,
     EvaluationCase,
     EvaluationError,
-    _evaluation_lock,
+    EvaluationSummary,
     dataset_fingerprint,
     generate_corpweb_dataset,
     read_cases,
@@ -19,8 +21,10 @@ from job_page_finder.evaluation import (
     summarize,
     write_summary,
 )
-from job_page_finder.runner import FindJobPageOutput, TaskMetadata, TaskResult
+from job_page_finder.evaluation.store import _evaluation_lock
 from job_page_finder.runtime import RuntimeConfig
+from job_page_finder.task_protocol import FindJobPageTaskOutput as FindJobPageOutput
+from job_page_finder.task_protocol import TaskMetadata, TaskResult
 
 
 def create_corpweb_database(path: Path) -> None:
@@ -308,7 +312,7 @@ async def test_executor_cancelled_error_becomes_runner_failure(tmp_path: Path) -
 async def test_resume_requires_manifest_and_repairs_torn_final_line(tmp_path: Path) -> None:
     dataset = tmp_path / "cases.jsonl"
     results = tmp_path / "results.jsonl"
-    write_cases(dataset, count=1)
+    write_cases(dataset, count=2)
 
     async def fake_run(request, config):
         return TaskResult(
@@ -328,11 +332,13 @@ async def test_resume_requires_manifest_and_repairs_torn_final_line(tmp_path: Pa
 
     config = RuntimeConfig(diagnostics_root=tmp_path / "diagnostics")
     await run_evaluation(dataset, results, workers=1, case_timeout=1, config=config, run_task_fn=fake_run)
+    complete_records = read_run_records(results)
     with results.open("ab") as stream:
         stream.write(b'{"partial"')
 
     summary = await run_evaluation(dataset, results, workers=1, case_timeout=1, config=config, run_task_fn=fake_run)
-    assert summary["completed_cases"] == 1
+    assert summary["completed_cases"] == 2
+    assert read_run_records(results) == complete_records
     assert results.read_bytes().endswith(b"\n")
 
     (tmp_path / "results.manifest.json").unlink()
@@ -430,7 +436,7 @@ async def test_results_path_expands_user_before_manifest_and_lock_access(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_missing_manifest_is_checked_before_torn_line_repair(tmp_path: Path) -> None:
+async def test_missing_manifest_does_not_modify_unknown_results(tmp_path: Path) -> None:
     dataset = tmp_path / "cases.jsonl"
     results = tmp_path / "results.jsonl"
     write_cases(dataset, count=1)
@@ -483,33 +489,57 @@ async def test_concurrent_evaluations_share_results_lock_without_deadlock(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_cancelling_evaluation_releases_results_for_a_later_run(tmp_path: Path) -> None:
+    dataset = tmp_path / "cases.jsonl"
+    results = tmp_path / "results.jsonl"
+    write_cases(dataset, count=1)
+    started = asyncio.Event()
+
+    async def blocked_run(request, config):
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    config = RuntimeConfig(diagnostics_root=tmp_path / "diagnostics")
+    cancelled = asyncio.create_task(
+        run_evaluation(dataset, results, workers=1, case_timeout=1, config=config, run_task_fn=blocked_run)
+    )
+    await started.wait()
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+
+    async def successful_run(request, config):
+        return TaskResult(
+            version="v1",
+            task_id=request["task_id"],
+            type="find_job_page",
+            status="succeeded",
+            output=FindJobPageOutput(
+                job_page_url="https://jobs.example/",
+                job_title="Engineer",
+                evidence="Engineer",
+                steps=1,
+            ),
+            error=None,
+            metadata=TaskMetadata(duration_ms=1),
+        )
+
+    summary = await asyncio.wait_for(
+        run_evaluation(dataset, results, workers=1, case_timeout=1, config=config, run_task_fn=successful_run),
+        timeout=1,
+    )
+    assert summary["completed_cases"] == 1
+    assert len(read_run_records(results)) == 1
+
+
+@pytest.mark.asyncio
 async def test_lock_body_error_is_not_mislabeled_and_lock_remains_usable(tmp_path: Path) -> None:
     results = tmp_path / "results.jsonl"
 
     with pytest.raises(OSError, match="body failure"):
         async with _evaluation_lock(results):
             raise OSError("body failure")
-
-    async with asyncio.timeout(1):
-        async with _evaluation_lock(results):
-            pass
-
-
-@pytest.mark.asyncio
-async def test_cancelling_lock_holder_releases_lock(tmp_path: Path) -> None:
-    results = tmp_path / "results.jsonl"
-    entered = asyncio.Event()
-
-    async def hold_lock() -> None:
-        async with _evaluation_lock(results):
-            entered.set()
-            await asyncio.sleep(10)
-
-    holder = asyncio.create_task(hold_lock())
-    await entered.wait()
-    holder.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await holder
 
     async with asyncio.timeout(1):
         async with _evaluation_lock(results):
@@ -546,7 +576,7 @@ async def test_lock_open_and_acquire_errors_are_evaluation_errors(monkeypatch, t
     def fail_flock(*args, **kwargs):
         raise OSError("flock failure")
 
-    monkeypatch.setattr(evaluation_module.fcntl, "flock", fail_flock)
+    monkeypatch.setattr(evaluation_store.fcntl, "flock", fail_flock)
     with pytest.raises(EvaluationError, match="could not lock evaluation results"):
         async with _evaluation_lock(results):
             pass
@@ -555,11 +585,11 @@ async def test_lock_open_and_acquire_errors_are_evaluation_errors(monkeypatch, t
 
     def contend_once(fd, operation):
         nonlocal attempts
-        if operation & evaluation_module.fcntl.LOCK_EX and attempts == 0:
+        if operation & evaluation_store.fcntl.LOCK_EX and attempts == 0:
             attempts += 1
             raise OSError(errno.EACCES, "lock is busy")
 
-    monkeypatch.setattr(evaluation_module.fcntl, "flock", contend_once)
+    monkeypatch.setattr(evaluation_store.fcntl, "flock", contend_once)
     async with _evaluation_lock(results):
         pass
     assert attempts == 1
@@ -577,24 +607,228 @@ async def test_lock_close_error_is_wrapped_without_masking_body_error(monkeypatc
             raise OSError("close failure")
 
     monkeypatch.setattr(Path, "open", lambda self, *args, **kwargs: FakeLockFile())
-    monkeypatch.setattr(evaluation_module.fcntl, "flock", lambda *args, **kwargs: None)
+    monkeypatch.setattr(evaluation_store.fcntl, "flock", lambda *args, **kwargs: None)
 
-    with pytest.raises(EvaluationError, match="could not close evaluation lock"):
-        async with _evaluation_lock(results):
-            pass
+    async with _evaluation_lock(results):
+        pass
 
     def fail_unlock(fd, operation):
-        if operation == evaluation_module.fcntl.LOCK_UN:
+        if operation == evaluation_store.fcntl.LOCK_UN:
             raise OSError("unlock failure")
 
-    monkeypatch.setattr(evaluation_module.fcntl, "flock", fail_unlock)
-    with pytest.raises(EvaluationError, match="could not unlock evaluation results"):
-        async with _evaluation_lock(results):
-            pass
+    monkeypatch.setattr(evaluation_store.fcntl, "flock", fail_unlock)
+    async with _evaluation_lock(results):
+        pass
 
     with pytest.raises(OSError, match="body failure"):
         async with _evaluation_lock(results):
             raise OSError("body failure")
+
+
+@pytest.mark.asyncio
+async def test_slow_lock_release_does_not_block_event_loop(monkeypatch, tmp_path: Path) -> None:
+    results = tmp_path / "results.jsonl"
+    real_flock = evaluation_store.fcntl.flock
+    release_started = asyncio.Event()
+
+    def slow_unlock(fd, operation):
+        if operation == evaluation_store.fcntl.LOCK_UN:
+            release_started.set()
+            time.sleep(0.05)
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(evaluation_store.fcntl, "flock", slow_unlock)
+    monkeypatch.setattr("job_page_finder.evaluation.store._RELEASE_TIMEOUT", 0.01)
+
+    started = time.perf_counter()
+    async with _evaluation_lock(results):
+        pass
+
+    assert release_started.is_set()
+    assert time.perf_counter() - started < 0.04
+    await asyncio.sleep(0.06)
+
+
+@pytest.mark.asyncio
+async def test_campaign_uses_application_port_and_finishes_resumed_campaign() -> None:
+    case = EvaluationCase(
+        case_id="case-1",
+        company_name="Company",
+        company_url="https://example.com/",
+        source="corpweb",
+        sample_bucket="bucket",
+    )
+    result = TaskResult(
+        version="v1",
+        task_id=case.case_id,
+        type="find_job_page",
+        status="succeeded",
+        output=FindJobPageOutput(
+            job_page_url="https://example.com/jobs",
+            job_title="Engineer",
+            evidence="Engineer",
+            steps=1,
+        ),
+        error=None,
+        metadata=TaskMetadata(duration_ms=1),
+    )
+
+    class Application:
+        async def run(self, request):
+            raise AssertionError(f"resumed case was executed: {request}")
+
+    class Session:
+        def completed_case_ids(self):
+            return {case.case_id}
+
+        def records(self):
+            from datetime import UTC, datetime
+
+            from job_page_finder.evaluation import EvaluationRunRecord
+
+            now = datetime.now(UTC)
+            return [
+                EvaluationRunRecord(
+                    run_id="run",
+                    dataset_fingerprint="0" * 64,
+                    case_id=case.case_id,
+                    execution_status="COMPLETED",
+                    started_at=now,
+                    finished_at=now,
+                    duration_ms=0,
+                    finder_result=result,
+                    runner_error=None,
+                )
+            ]
+
+        def append(self, record):
+            raise AssertionError(f"no append expected: {record}")
+
+        def finish(self, summary):
+            self.summary = summary
+
+    session = Session()
+
+    class Store:
+        def open_campaign(self):
+            class Context:
+                async def __aenter__(self):
+                    return session
+
+                async def __aexit__(self, *args):
+                    return None
+
+            return Context()
+
+    summary = await EvaluationCampaign(
+        Application(), Store(), concurrency=1, case_timeout=1, campaign_id="run", dataset_fingerprint="0" * 64
+    ).run([case])
+
+    assert summary == EvaluationSummary(total=1, completed=1, succeeded=1, failed=0, success_rate=1.0)
+    assert session.summary == summary
+
+
+@pytest.mark.asyncio
+async def test_campaign_materializes_generator_before_opening_session() -> None:
+    cases = [
+        EvaluationCase(
+            case_id="generator-case",
+            company_name="Company",
+            company_url="https://example.com/",
+            source="corpweb",
+            sample_bucket="bucket",
+        )
+    ]
+    executed: list[str] = []
+
+    class Application:
+        async def run(self, request):
+            executed.append(request["task_id"])
+            return TaskResult(
+                version="v1",
+                task_id=request["task_id"],
+                type="find_job_page",
+                status="succeeded",
+                output=FindJobPageOutput(
+                    job_page_url="https://example.com/jobs", job_title="Engineer", evidence="x", steps=1
+                ),
+                error=None,
+                metadata=TaskMetadata(duration_ms=1),
+            )
+
+    class Session:
+        def completed_case_ids(self):
+            return set()
+
+        def records(self):
+            return [self.record] if hasattr(self, "record") else []
+
+        def append(self, record):
+            self.record = record
+
+        def finish(self, summary):
+            self.summary = summary
+
+    session = Session()
+
+    class Store:
+        def open_campaign(self):
+            class Context:
+                async def __aenter__(self):
+                    return session
+
+                async def __aexit__(self, *args):
+                    return None
+
+            return Context()
+
+    summary = await EvaluationCampaign(
+        Application(), Store(), concurrency=1, case_timeout=1, campaign_id="run", dataset_fingerprint="0" * 64
+    ).run(case for case in cases)
+
+    assert executed == ["generator-case"]
+    assert summary == EvaluationSummary(total=1, completed=1, succeeded=1, failed=0, success_rate=1.0)
+    assert session.summary == summary
+
+
+def test_corpweb_source_resolves_relative_database_path(monkeypatch, tmp_path: Path) -> None:
+    database = tmp_path / "companies.sqlite3"
+    create_corpweb_database(database)
+    monkeypatch.chdir(tmp_path)
+
+    manifest = generate_corpweb_dataset(Path("companies.sqlite3"), tmp_path / "cases.jsonl", sample_size=1)
+
+    assert manifest["database_path"] == str(database.resolve())
+
+
+@pytest.mark.asyncio
+async def test_default_evaluation_builds_one_reusable_application(monkeypatch, tmp_path: Path) -> None:
+    dataset = tmp_path / "cases.jsonl"
+    results = tmp_path / "results.jsonl"
+    write_cases(dataset, count=2)
+    builds = 0
+
+    class Application:
+        async def run(self, request):
+            return TaskResult(
+                version="v1",
+                task_id=request["task_id"],
+                type="find_job_page",
+                status="failed",
+                output=None,
+                error={"code": "MAX_STEPS_REACHED", "message": "not found", "retryable": False},
+                metadata=TaskMetadata(duration_ms=1),
+            )
+
+    def build(*args, **kwargs):
+        nonlocal builds
+        builds += 1
+        return Application()
+
+    monkeypatch.setattr("job_page_finder.evaluation._impl.build_application", build)
+    await run_evaluation(dataset, results, workers=2, case_timeout=1)
+
+    assert builds == 1
 
 
 @pytest.mark.asyncio

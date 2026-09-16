@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from job_page_finder import create_deepseek_llm, load_environment
+from job_page_finder.config import create_deepseek_llm, load_environment
 
 
 def test_creates_deepseek_client_from_env_file(tmp_path, monkeypatch) -> None:

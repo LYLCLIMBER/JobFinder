@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from job_page_finder.core_models import ElementRef
+from job_page_finder.core_models import ScrollTarget as PublicScrollTarget
+
 ScrollDirection = Literal["up", "down"]
 
 
@@ -22,6 +25,76 @@ class ScrollTarget:
 
     def can_scroll(self, direction: ScrollDirection) -> bool:
         return self.remaining_down > 0 if direction == "down" else self.remaining_up > 0
+
+
+@dataclass(frozen=True)
+class ScrollTargetIndex:
+    public_targets: tuple[PublicScrollTarget, ...]
+    bindings: dict[ElementRef, ScrollTarget]
+    internal_targets: tuple[ScrollTarget, ...]
+    refs_by_index: dict[int, ElementRef]
+
+
+def discover_scroll_target_index(
+    state: Any, *, refs_by_index: dict[int, ElementRef] | None = None, generation: int = 0
+) -> ScrollTargetIndex:
+    refs_by_index = dict(refs_by_index or {})
+    targets = discover_scroll_targets(state)
+    bindings: dict[ElementRef, ScrollTarget] = {}
+    public = []
+    for target in targets:
+        ref = refs_by_index.setdefault(target.index, ElementRef(f"observation:{generation}:index:{target.index}"))
+        bindings[ref] = target
+        node = target.node
+        label = f"<{getattr(node, 'tag_name', 'element')}>"
+        text = str(getattr(node, "get_meaningful_text_for_llm", lambda: "")()).strip()
+        if text:
+            label += f" {text[:120]}"
+        if target.in_active_modal:
+            label += " (active modal)"
+        directions = []
+        if target.remaining_up > 0:
+            directions.append(f"up {target.remaining_up:g}px")
+        if target.remaining_down > 0:
+            directions.append(f"down {target.remaining_down:g}px")
+        availability = ", ".join(directions) if directions else "no remaining scroll space"
+        public.append(
+            PublicScrollTarget(
+                ref=ref,
+                description=f"{label}: offset {target.offset:g}px; {availability}",
+                can_scroll_up=target.remaining_up > 0,
+                can_scroll_down=target.remaining_down > 0,
+            )
+        )
+    root = root_scroll_target(state)
+    root_directions = []
+    if root.remaining_up > 0:
+        root_directions.append(f"up {root.remaining_up:g}px")
+    if root.remaining_down > 0:
+        root_directions.append(f"down {root.remaining_down:g}px")
+    root_availability = ", ".join(root_directions) if root_directions else "no remaining scroll space"
+    return ScrollTargetIndex(
+        public_targets=(
+            PublicScrollTarget(
+                ref=None,
+                description=f"root page: offset {root.offset:g}px; {root_availability}",
+                can_scroll_up=root.remaining_up > 0,
+                can_scroll_down=root.remaining_down > 0,
+            ),
+            *public,
+        ),
+        bindings=bindings,
+        internal_targets=targets,
+        refs_by_index=refs_by_index,
+    )
+
+
+def resolve_scroll_target(state: Any, ref: ElementRef) -> ScrollTarget | None:
+    try:
+        index = int(ref.value.rsplit(":", maxsplit=1)[-1])
+    except ValueError:
+        return None
+    return next((target for target in discover_scroll_targets(state) if target.index == index), None)
 
 
 def discover_scroll_targets(state: Any) -> tuple[ScrollTarget, ...]:

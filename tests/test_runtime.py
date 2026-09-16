@@ -1,26 +1,41 @@
+import asyncio
 import inspect
 import logging
 
 import pytest
 
-from job_page_finder import cli, runtime
-from job_page_finder.finder import JobPageFinder
+import job_page_finder
+from job_page_finder import api, cli, runtime
 from job_page_finder.models import JobPageFinderInput, JobPageFinderResult
 from job_page_finder.runner import TaskRunner
-from job_page_finder.runtime import RuntimeConfig, create_runner, run_task
+from job_page_finder.runtime import RuntimeConfig, create_runner, run_task, settings_from_config
+from job_page_finder.settings import DiagnosticsSettings, FinderSettings
 
 
-def test_create_runner_is_the_only_composition_root() -> None:
-    """Keep Finder assembly in create_runner so CLI and run_task reuse it."""
+def test_package_root_exports_only_the_stable_api() -> None:
+    assert job_page_finder.__all__ == [
+        "DiagnosticsSettings",
+        "RuntimeSettings",
+        "TaskRequest",
+        "TaskResult",
+        "run_task",
+    ]
+
+
+def test_build_application_is_the_only_composition_root() -> None:
+    """Keep Finder assembly in runtime.build_application so API and CLI reuse it."""
     cli_source = inspect.getsource(cli)
+    api_source = inspect.getsource(api)
     runtime_source = inspect.getsource(runtime)
 
-    assert "run_task" in cli_source
+    assert "build_application" in cli_source
     assert "JobPageFinder(" not in cli_source
     assert "create_deepseek_llm" not in cli_source
+    assert "parse_task" not in api_source
+    assert "build_application" in api_source
     assert "JobPageFinder(" in runtime_source
     assert "create_deepseek_llm" in runtime_source
-    assert "TaskRunner(" in runtime_source
+    assert "def build_application" in runtime_source
 
 
 def test_create_runner_wires_injected_dependencies(monkeypatch) -> None:
@@ -28,8 +43,9 @@ def test_create_runner_wires_injected_dependencies(monkeypatch) -> None:
     captured: dict = {}
 
     class FakeFinder:
-        def __init__(self, llm, **kwargs) -> None:
-            captured["llm"] = llm
+        def __init__(self, browser_factory, action_model, **kwargs) -> None:
+            captured["browser_factory"] = browser_factory
+            captured["action_model"] = action_model
             captured.update(kwargs)
 
     def should_not_load_environment(**kwargs):
@@ -49,29 +65,52 @@ def test_create_runner_wires_injected_dependencies(monkeypatch) -> None:
     )
 
     assert isinstance(runner, TaskRunner)
-    assert captured["llm"] is llm
-    assert captured["tools"] is tools
-    assert captured["browser_factory"] is factory
-    assert captured["step_timeout"] == 9
-    assert captured["use_vision"] is True
-    assert captured["max_visual_candidates"] == 4
+    assert captured == {}
+    asyncio.run(
+        runner.run(
+            {
+                "version": "v1",
+                "type": "find_job_page",
+                "payload": {"company_url": "https://example.com"},
+            }
+        )
+    )
+    assert captured["action_model"]._llm is llm
+    assert captured["browser_factory"]._browser_factory is factory
+    assert captured["browser_factory"]._tools is tools
+    assert captured["settings"].step_timeout == 9
+    assert captured["settings"].use_vision is True
+    assert captured["browser_factory"].max_visual_candidates == 4
 
 
 def test_default_vision_is_enabled_and_can_be_explicitly_disabled(monkeypatch) -> None:
     captured: list[bool] = []
 
     class FakeFinder:
-        def __init__(self, llm, **kwargs) -> None:
-            captured.append(kwargs["use_vision"])
+        def __init__(self, browser_factory, action_model, **kwargs) -> None:
+            captured.append(kwargs["settings"].use_vision)
 
     monkeypatch.setattr("job_page_finder.runtime.JobPageFinder", FakeFinder)
 
     assert RuntimeConfig().use_vision is True
-    assert JobPageFinder(llm=object()).use_vision is True
-    create_runner(llm=object())
-    create_runner(llm=object(), config=RuntimeConfig(use_vision=False))
+    assert FinderSettings().use_vision is True
+    request = {
+        "version": "v1",
+        "type": "find_job_page",
+        "payload": {"company_url": "https://example.com"},
+    }
+    asyncio.run(create_runner(llm=object()).run(request))
+    asyncio.run(create_runner(llm=object(), config=RuntimeConfig(use_vision=False)).run(request))
 
     assert captured == [True, False]
+
+
+def test_diagnostics_screenshot_override_survives_runtime_settings_mapping() -> None:
+    settings = settings_from_config(RuntimeConfig(diagnostics_level="raw", diagnostics_screenshots=False))
+
+    assert settings.diagnostics.level == "raw"
+    assert settings.diagnostics.capture_screenshots is False
+    assert DiagnosticsSettings().capture_screenshots is None
 
 
 @pytest.mark.asyncio
@@ -88,11 +127,20 @@ async def test_run_task_uses_create_runner_unless_runner_is_injected(monkeypatch
             steps=1,
         )
 
-    def fake_create_runner(**kwargs):
-        calls.append(kwargs)
-        return TaskRunner(fake_find)
+    class FakeApplication:
+        async def run(self, request, *, emit_started: bool = True):
+            from job_page_finder.models import from_legacy_finder_result, to_legacy_finder_request
+            from job_page_finder.task_protocol import build_task_result, parse_task, to_finder_request
 
-    monkeypatch.setattr("job_page_finder.runtime.create_runner", fake_create_runner)
+            parsed = parse_task(request)
+            legacy = await fake_find(to_legacy_finder_request(to_finder_request(parsed.payload)))
+            return build_task_result(parsed, from_legacy_finder_result(legacy), duration_ms=1)
+
+    def fake_build_application(*args, **kwargs):
+        calls.append(kwargs)
+        return FakeApplication()
+
+    monkeypatch.setattr("job_page_finder.runtime.build_application", fake_build_application)
     request = {
         "version": "v1",
         "type": "find_job_page",
@@ -142,7 +190,7 @@ async def test_run_task_maps_assembly_failures_to_configuration_error(monkeypatc
     def boom(**kwargs):
         raise RuntimeError("DEEPSEEK_API_KEY is not configured")
 
-    monkeypatch.setattr("job_page_finder.runtime.create_runner", boom)
+    monkeypatch.setattr("job_page_finder.runtime.create_deepseek_llm", boom)
     result = await run_task(
         {
             "version": "v1",
@@ -166,7 +214,7 @@ async def test_run_task_rejects_invalid_requests_before_create_runner(monkeypatc
     def boom(**kwargs):
         raise RuntimeError("DEEPSEEK_API_KEY is not configured")
 
-    monkeypatch.setattr("job_page_finder.runtime.create_runner", boom)
+    monkeypatch.setattr("job_page_finder.runtime.create_deepseek_llm", boom)
     invalid_version = await run_task(
         {
             "version": "v2",
@@ -230,12 +278,12 @@ def _assert_single_started_then_finished(
 @pytest.mark.asyncio
 async def test_run_task_logs_invalid_requests(monkeypatch, caplog) -> None:
     """Log started before validation and finished after INVALID_TASK."""
-    caplog.set_level(logging.INFO, logger="job_page_finder.runner")
+    caplog.set_level(logging.INFO, logger="job_page_finder")
 
     def boom(**kwargs):
-        raise AssertionError("create_runner should not run for invalid requests")
+        raise AssertionError("provider assembly should not run for invalid requests")
 
-    monkeypatch.setattr("job_page_finder.runtime.create_runner", boom)
+    monkeypatch.setattr("job_page_finder.runtime.create_deepseek_llm", boom)
     result = await run_task(
         {
             "version": "v2",
@@ -259,12 +307,12 @@ async def test_run_task_logs_invalid_requests(monkeypatch, caplog) -> None:
 @pytest.mark.asyncio
 async def test_run_task_logs_unsupported_task_type(monkeypatch, caplog) -> None:
     """Log started before validation and finished after UNSUPPORTED_TASK_TYPE."""
-    caplog.set_level(logging.INFO, logger="job_page_finder.runner")
+    caplog.set_level(logging.INFO, logger="job_page_finder")
 
     def boom(**kwargs):
-        raise AssertionError("create_runner should not run for unsupported types")
+        raise AssertionError("provider assembly should not run for unsupported types")
 
-    monkeypatch.setattr("job_page_finder.runtime.create_runner", boom)
+    monkeypatch.setattr("job_page_finder.runtime.create_deepseek_llm", boom)
     result = await run_task(
         {
             "version": "v1",
@@ -288,7 +336,7 @@ async def test_run_task_logs_unsupported_task_type(monkeypatch, caplog) -> None:
 @pytest.mark.asyncio
 async def test_run_task_logs_configuration_errors(monkeypatch, caplog) -> None:
     """Log started before composition and finished after CONFIGURATION_ERROR."""
-    caplog.set_level(logging.INFO, logger="job_page_finder.runner")
+    caplog.set_level(logging.INFO, logger="job_page_finder")
     saw_started_before_assembly = False
 
     def boom(**kwargs):
@@ -298,7 +346,7 @@ async def test_run_task_logs_configuration_errors(monkeypatch, caplog) -> None:
         )
         raise RuntimeError("DEEPSEEK_API_KEY is not configured")
 
-    monkeypatch.setattr("job_page_finder.runtime.create_runner", boom)
+    monkeypatch.setattr("job_page_finder.runtime.create_deepseek_llm", boom)
     result = await run_task(
         {
             "version": "v1",
@@ -323,7 +371,7 @@ async def test_run_task_logs_configuration_errors(monkeypatch, caplog) -> None:
 @pytest.mark.asyncio
 async def test_run_task_does_not_duplicate_lifecycle_logs(monkeypatch, caplog) -> None:
     """Keep a single started/finished pair when run_task delegates to the runner."""
-    caplog.set_level(logging.INFO, logger="job_page_finder.runner")
+    caplog.set_level(logging.INFO, logger="job_page_finder")
 
     async def fake_find(finder_input: JobPageFinderInput) -> JobPageFinderResult:
         return JobPageFinderResult(
@@ -334,7 +382,10 @@ async def test_run_task_does_not_duplicate_lifecycle_logs(monkeypatch, caplog) -
             steps=1,
         )
 
-    monkeypatch.setattr("job_page_finder.runtime.create_runner", lambda **kwargs: TaskRunner(fake_find))
+    monkeypatch.setattr(
+        "job_page_finder.runtime.build_application",
+        lambda *args, **kwargs: TaskRunner(fake_find),
+    )
     result = await run_task(
         {
             "version": "v1",

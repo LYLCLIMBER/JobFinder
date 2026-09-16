@@ -1,6 +1,15 @@
-from typing import Annotated, Literal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
+
+from job_page_finder.contracts import (
+    RETRYABLE_FINDER_FAILURE_CODES,
+    FindJobPageFailure,
+    FindJobPageRequest,
+    FindJobPageResult,
+    FindJobPageSuccess,
+    JobEvidence,
+)
 
 FinderErrorCode = Literal[
     "BROWSER_INITIALIZATION_FAILED",
@@ -38,40 +47,35 @@ class JobPageFinderResult(BaseModel):
         return self
 
 
-class ClickAction(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    type: Literal["click"]
-    index: int = Field(ge=1)
+def to_legacy_finder_request(request: FindJobPageRequest) -> JobPageFinderInput:
+    return JobPageFinderInput(company_url=request.company_url, max_steps=request.max_steps)
 
 
-class ScrollAction(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    type: Literal["scroll"]
-    direction: Literal["up", "down"]
-    index: int | None = Field(default=None, ge=0)
+class LegacyFinderResultError(ValueError):
+    def __init__(self, public_message: str) -> None:
+        self.public_message = public_message
+        super().__init__(public_message)
 
 
-class WaitAction(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    type: Literal["wait"]
-    seconds: int = Field(ge=1, le=5)
-
-
-class DoneAction(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    type: Literal["done"]
-    job_title: str = Field(min_length=1)
-    evidence: str = Field(min_length=1)
-
-
-FinderAction = Annotated[ClickAction | ScrollAction | WaitAction | DoneAction, Field(discriminator="type")]
-
-
-class AgentDecision(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    decision: FinderAction
+def from_legacy_finder_result(result: JobPageFinderResult) -> FindJobPageResult:
+    if result.success:
+        if not (result.job_page_url and result.job_title and result.evidence):
+            raise LegacyFinderResultError("Finder returned a successful result without job page fields")
+        # The stage 1 bridge must preserve strings accepted by the old public
+        # executor boundary. Normal construction of the new contract remains validated.
+        return FindJobPageSuccess.model_construct(
+            status="succeeded",
+            job_page_url=result.job_page_url,
+            job_title=result.job_title,
+            evidence=JobEvidence.model_construct(quote=result.evidence, source_url=result.job_page_url),
+            steps=result.steps,
+        )
+    if result.error_code is None:
+        raise LegacyFinderResultError(result.error or "Task failed")
+    return FindJobPageFailure(
+        status="failed",
+        code=result.error_code,
+        message=result.error or "Task failed",
+        retryable=result.error_code in RETRYABLE_FINDER_FAILURE_CODES,
+        steps=result.steps,
+    )

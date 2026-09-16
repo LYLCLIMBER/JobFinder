@@ -3,12 +3,14 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-from browser_use import BrowserSession
-from browser_use.browser.profile import BrowserProfile
 from browser_use.llm.views import ChatInvokeCompletion
 
-from job_page_finder import JobPageFinder, JobPageFinderInput, run_task
-from job_page_finder.models import AgentDecision
+from job_page_finder.adapters.browser_use.gateway import BrowserUseFactory
+from job_page_finder.adapters.models.browser_use_chat import AgentDecision
+from job_page_finder.contracts import FindJobPageRequest, FindJobPageSuccess
+from job_page_finder.core_models import ObservationOptions
+from job_page_finder.runtime import run_task
+from tests.helpers import assemble_finder
 
 
 class StaticSiteHandler(BaseHTTPRequestHandler):
@@ -69,8 +71,10 @@ class LocalSiteLlm:
                 "evidence": "Senior Backend Engineer Remote - Engineering",
             }
         else:
-            content_before_careers = browser_state.split("Careers", maxsplit=1)[0]
-            indexes = re.findall(r"\[(\d+)\]", content_before_careers)
+            interactive_elements = browser_state.split("<interactive_elements>", maxsplit=1)[1].split(
+                "</interactive_elements>", maxsplit=1
+            )[0]
+            indexes = re.findall(r"\[(\d+)\]", interactive_elements)
             assert indexes
             decision = {"type": "click", "index": int(indexes[-1])}
 
@@ -114,37 +118,59 @@ class ScrollSnapLlm:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_browser_use_adapter_clicks_and_scrolls_with_local_chromium() -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), StaticSiteHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    factory = BrowserUseFactory(block_ip_addresses=False)
+
+    browser = None
+    try:
+        browser = await factory.open()
+        await browser.navigate(f"http://127.0.0.1:{port}")
+        home = await browser.observe()
+        careers = next(element for element in home.elements if "Careers" in element.text)
+        await browser.click(careers.ref)
+        jobs = await browser.observe()
+        assert "Senior Backend Engineer" in jobs.visible_text
+
+        await browser.navigate(f"http://127.0.0.1:{port}/scroll-snap")
+        scroll_page = await browser.observe(ObservationOptions(include_image=True))
+        target = next(target for target in scroll_page.scroll_targets if target.ref is not None)
+        await browser.scroll(target=target.ref, direction="down")
+        after_scroll = await browser.observe()
+        assert "Principal Scroll Engineer" in after_scroll.visible_text
+    finally:
+        if browser is not None:
+            await browser.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_company_home_to_job_page_with_local_chromium() -> None:
     server = ThreadingHTTPServer(("127.0.0.1", 0), StaticSiteHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     port = server.server_address[1]
 
-    def create_browser() -> BrowserSession:
-        return BrowserSession(
-            browser_profile=BrowserProfile(
-                headless=True,
-                user_data_dir=None,
-                accept_downloads=False,
-                auto_download_pdfs=False,
-                highlight_elements=False,
-                dom_highlight_elements=False,
-                enable_default_extensions=False,
-                block_ip_addresses=False,
-            )
-        )
+    browser_factory = BrowserUseFactory(block_ip_addresses=False)
 
     try:
-        finder = JobPageFinder(llm=LocalSiteLlm(), browser_factory=create_browser)
-        result = await finder.find(JobPageFinderInput(company_url=f"http://127.0.0.1:{port}", max_steps=3))
+        finder = assemble_finder(LocalSiteLlm(), browser_factory=browser_factory.create_session)
+        result = await finder.find(FindJobPageRequest(company_url=f"http://127.0.0.1:{port}", max_steps=3))
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
 
-    assert result.success is True
+    assert result.status == "succeeded"
+    assert isinstance(result, FindJobPageSuccess)
     assert result.job_title == "Senior Backend Engineer"
-    assert result.job_page_url == f"http://127.0.0.1:{port}/careers"
+    assert str(result.job_page_url) == f"http://127.0.0.1:{port}/careers"
     assert result.steps == 2
 
 
@@ -157,29 +183,21 @@ async def test_internal_css_scroll_snap_reveals_job_with_local_chromium(use_targ
     thread.start()
     port = server.server_address[1]
 
-    def create_browser() -> BrowserSession:
-        return BrowserSession(
-            browser_profile=BrowserProfile(
-                headless=True,
-                user_data_dir=None,
-                accept_downloads=False,
-                auto_download_pdfs=False,
-                highlight_elements=False,
-                dom_highlight_elements=False,
-                enable_default_extensions=False,
-                block_ip_addresses=False,
-            )
-        )
+    browser_factory = BrowserUseFactory(block_ip_addresses=False)
 
     try:
-        finder = JobPageFinder(llm=ScrollSnapLlm(use_target_index=use_target_index), browser_factory=create_browser)
-        result = await finder.find(JobPageFinderInput(company_url=f"http://127.0.0.1:{port}/scroll-snap", max_steps=3))
+        finder = assemble_finder(
+            ScrollSnapLlm(use_target_index=use_target_index),
+            browser_factory=browser_factory.create_session,
+        )
+        result = await finder.find(FindJobPageRequest(company_url=f"http://127.0.0.1:{port}/scroll-snap", max_steps=3))
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
 
-    assert result.success is True
+    assert result.status == "succeeded"
+    assert isinstance(result, FindJobPageSuccess)
     assert result.job_title == "Principal Scroll Engineer"
     assert result.steps == 2
 
@@ -192,19 +210,7 @@ async def test_unified_runner_company_home_to_job_page_with_local_chromium() -> 
     thread.start()
     port = server.server_address[1]
 
-    def create_browser() -> BrowserSession:
-        return BrowserSession(
-            browser_profile=BrowserProfile(
-                headless=True,
-                user_data_dir=None,
-                accept_downloads=False,
-                auto_download_pdfs=False,
-                highlight_elements=False,
-                dom_highlight_elements=False,
-                enable_default_extensions=False,
-                block_ip_addresses=False,
-            )
-        )
+    browser_factory = BrowserUseFactory(block_ip_addresses=False)
 
     try:
         result = await run_task(
@@ -215,7 +221,7 @@ async def test_unified_runner_company_home_to_job_page_with_local_chromium() -> 
                 "payload": {"company_url": f"http://127.0.0.1:{port}", "max_steps": 3},
             },
             llm=LocalSiteLlm(),
-            browser_factory=create_browser,
+            browser_factory=browser_factory.create_session,
         )
     finally:
         server.shutdown()

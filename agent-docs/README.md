@@ -16,6 +16,8 @@
 | JF-006 | Default Vision and Kurogames Test | review | [spec](tasks/JF-006-default-vision-and-kurogames-test/spec.md) · [handoff](tasks/JF-006-default-vision-and-kurogames-test/handoff.md) · [verification](tasks/JF-006-default-vision-and-kurogames-test/verification.md) |
 | JF-007 | Targeted Scroll Discovery and Verification | done | [spec](tasks/JF-007-targeted-scroll/spec.md) · [execution](tasks/JF-007-targeted-scroll/execution.md) · [handoff](tasks/JF-007-targeted-scroll/handoff.md) · [verification](tasks/JF-007-targeted-scroll/verification.md) |
 | JF-008 | Asynchronous Scroll Route Detection | done | [spec](tasks/JF-008-scroll-route-detection/spec.md) · [execution](tasks/JF-008-scroll-route-detection/execution.md) · [handoff](tasks/JF-008-scroll-route-detection/handoff.md) · [verification](tasks/JF-008-scroll-route-detection/verification.md) |
+| JF-010 | Current Behavior Baseline | done | [spec](tasks/JF-010-project-specification/spec.md) · [handoff](tasks/JF-010-project-specification/handoff.md) · [verification](tasks/JF-010-project-specification/verification.md) |
+| JF-011 | Modular Refactoring Phase 0 Behavior Gates | done | [spec](tasks/JF-011-behavior-gates/spec.md) · [handoff](tasks/JF-011-behavior-gates/handoff.md) · [verification](tasks/JF-011-behavior-gates/verification.md) |
 
 ## 阅读顺序
 

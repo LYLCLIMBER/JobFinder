@@ -8,6 +8,8 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
+from job_page_finder.core_models import ElementRef
+
 
 @dataclass(frozen=True)
 class VisualContext:
@@ -16,6 +18,32 @@ class VisualContext:
     image_data_url: str
     annotated_indexes: tuple[int, ...]
     candidates: tuple[tuple[int, tuple[int, int, int, int]], ...]
+
+
+@dataclass(frozen=True)
+class VisualSnapshot:
+    """Adapter-internal annotated screenshot and candidate bindings."""
+
+    screenshot: bytes
+    candidate_boxes: dict[ElementRef, tuple[int, int, int, int]]
+
+
+def build_visual_snapshot(
+    state: Any,
+    *,
+    element_refs: dict[int, ElementRef],
+    max_candidates: int,
+    scroll_targets: tuple[Any, ...] = (),
+) -> VisualSnapshot | None:
+    context = build_visual_context(state, max_candidates=max_candidates, scroll_targets=scroll_targets)
+    if context is None:
+        return None
+    try:
+        screenshot = base64.b64decode(context.image_data_url.partition(",")[2], validate=True)
+    except ValueError:
+        return None
+    boxes = {element_refs[index]: box for index, box in context.candidates if index in element_refs}
+    return VisualSnapshot(screenshot=screenshot, candidate_boxes=boxes)
 
 
 def build_visual_context(

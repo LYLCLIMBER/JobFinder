@@ -1,14 +1,15 @@
+from __future__ import annotations
+
 import argparse
 import asyncio
 import json
 import logging
 import sys
-from collections.abc import Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 
 from pydantic import ValidationError
 
-from job_page_finder import runtime
 from job_page_finder.evaluation import (
     DEFAULT_SAMPLE_SEED,
     DEFAULT_SAMPLE_SIZE,
@@ -19,13 +20,21 @@ from job_page_finder.evaluation import (
     validate_evaluation_run_id,
     write_summary,
 )
-from job_page_finder.runner import TaskResult, build_failed_result, resolve_task_id
-from job_page_finder.runtime import RuntimeConfig, run_task
+from job_page_finder.runner import resolve_task_id
+from job_page_finder.runtime import RuntimeConfig, build_application, settings_from_config
+from job_page_finder.settings import RuntimeSettings
+from job_page_finder.task_protocol import TaskResult, build_task_failure
 
 EXIT_SUCCESS = 0
 EXIT_TASK_FAILED = 1
 EXIT_INVALID_INPUT = 2
 EXIT_CONFIGURATION_ERROR = 3
+_EXIT_PRIORITY = {
+    EXIT_SUCCESS: 0,
+    EXIT_TASK_FAILED: 1,
+    EXIT_INVALID_INPUT: 2,
+    EXIT_CONFIGURATION_ERROR: 3,
+}
 
 
 class _CliUsageError(ValueError):
@@ -41,14 +50,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = _JsonArgumentParser(prog="jobfinder", description="Run JobFinder tasks")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    run_parser = subparsers.add_parser("run", help="Run a JSON task file")
-    run_parser.add_argument("task_file")
+    run_parser = subparsers.add_parser("run", help="Run TaskRequest JSONL from a file or stdin")
+    run_parser.add_argument("input_path", nargs="?", default=None)
     _add_diagnostics_arguments(run_parser)
-
-    find_parser = subparsers.add_parser("find-job-page", help="Find a job listing page")
-    find_parser.add_argument("company_url")
-    find_parser.add_argument("--max-steps", type=int, default=8)
-    _add_diagnostics_arguments(find_parser)
 
     evaluate_parser = subparsers.add_parser("evaluate", help="Generate and run operational evaluations")
     evaluate_subparsers = evaluate_parser.add_subparsers(dest="evaluate_command", required=True)
@@ -89,7 +93,9 @@ def _add_diagnostics_arguments(
     infer_diagnostics_root: bool = False,
 ) -> None:
     parser.add_argument("--diagnostics-level", choices=("basic", "diagnostic", "raw"), default=diagnostics_level)
-    default_root = None if infer_diagnostics_root else (diagnostics_root or runtime.DEFAULT_DIAGNOSTICS_ROOT)
+    from job_page_finder import settings as settings_module
+
+    default_root = None if infer_diagnostics_root else (diagnostics_root or settings_module.DEFAULT_DIAGNOSTICS_ROOT)
     parser.add_argument("--diagnostics-root", type=Path, default=default_root)
     parser.add_argument("--diagnostics-screenshots", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--diagnostics-max-runs", type=int, default=100)
@@ -108,8 +114,9 @@ def _configure_logging() -> None:
 
 
 def _print_result(result: TaskResult) -> None:
-    sys.stdout.write(result.model_dump_json(indent=2))
+    sys.stdout.write(result.model_dump_json())
     sys.stdout.write("\n")
+    sys.stdout.flush()
 
 
 def _print_json(value: object) -> None:
@@ -128,43 +135,88 @@ def _exit_code(result: TaskResult) -> int:
     return EXIT_TASK_FAILED
 
 
-def _load_task_file(path_value: str) -> tuple[dict[str, object] | None, TaskResult | None]:
+def _merge_exit_code(current: int, result: TaskResult) -> int:
+    code = _exit_code(result)
+    if _EXIT_PRIORITY[code] > _EXIT_PRIORITY[current]:
+        return code
+    return current
+
+
+def _invalid_input(message: str) -> TaskResult:
+    return build_task_failure(
+        task_id=resolve_task_id(None),
+        task_type="unknown",
+        code="INVALID_TASK",
+        message=message,
+        duration_ms=0,
+    )
+
+
+def _parse_json_object(raw: str, *, kind: str) -> dict[str, object] | TaskResult:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return _invalid_input(f"{kind} is not valid JSON: {exc.msg}")
+    if not isinstance(payload, dict):
+        return _invalid_input(f"{kind} must contain a JSON object")
+    return payload
+
+
+def _iter_jsonl_lines(path_value: str | None) -> Iterator[str | TaskResult]:
+    if path_value is None or path_value == "-":
+        try:
+            yield from _non_empty_lines(sys.stdin)
+        except (UnicodeDecodeError, OSError) as exc:
+            yield _invalid_input(f"Task input could not be read: {exc}")
+        return
     path = Path(path_value)
     if not path.is_file():
-        return None, build_failed_result(
-            task_id=resolve_task_id(None),
-            task_type="unknown",
-            code="INVALID_TASK",
-            message=f"Task file does not exist: {path}",
-            duration_ms=0,
-        )
+        yield _invalid_input(f"Task file does not exist: {path}")
+        return
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        return None, build_failed_result(
-            task_id=resolve_task_id(None),
-            task_type="unknown",
-            code="INVALID_TASK",
-            message=f"Task file is not valid JSON: {exc.msg}",
-            duration_ms=0,
+        with path.open(encoding="utf-8") as handle:
+            yield from _non_empty_lines(handle)
+    except UnicodeDecodeError as exc:
+        yield _invalid_input(f"Task file could not be read: {exc}")
+    except OSError as exc:
+        yield _invalid_input(f"Task file could not be read: {exc}")
+
+
+def _non_empty_lines(stream: Iterable[str]) -> Iterator[str]:
+    for line in stream:
+        if line.strip():
+            yield line
+
+
+async def _run_payloads(
+    payloads: Iterable[dict[str, object] | TaskResult],
+    settings: RuntimeSettings,
+    *,
+    diagnostics_screenshots: bool | None = None,
+) -> int:
+    # Kept for callers of this internal helper from older integrations; normal
+    # configuration now carries the override in DiagnosticsSettings.
+    if diagnostics_screenshots is not None:
+        settings = settings.model_copy(
+            update={
+                "diagnostics": settings.diagnostics.model_copy(update={"capture_screenshots": diagnostics_screenshots})
+            }
         )
-    except (OSError, UnicodeDecodeError) as exc:
-        return None, build_failed_result(
-            task_id=resolve_task_id(None),
-            task_type="unknown",
-            code="INVALID_TASK",
-            message=f"Task file could not be read: {exc}",
-            duration_ms=0,
-        )
-    if not isinstance(payload, dict):
-        return None, build_failed_result(
-            task_id=resolve_task_id(None),
-            task_type="unknown",
-            code="INVALID_TASK",
-            message="Task file must contain a JSON object",
-            duration_ms=0,
-        )
-    return payload, None
+    application = build_application(settings)
+    exit_code = EXIT_SUCCESS
+    for payload in payloads:
+        result = payload if isinstance(payload, TaskResult) else await application.run(payload)
+        _print_result(result)
+        exit_code = _merge_exit_code(exit_code, result)
+    return exit_code
+
+
+def _jsonl_payloads(path_value: str | None) -> Iterator[dict[str, object] | TaskResult]:
+    for item in _iter_jsonl_lines(path_value):
+        if isinstance(item, TaskResult):
+            yield item
+        else:
+            yield _parse_json_object(item, kind="Task line")
 
 
 def _runtime_config(args: argparse.Namespace) -> RuntimeConfig:
@@ -242,49 +294,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
     except _CliUsageError as exc:
-        result = build_failed_result(
-            task_id=resolve_task_id(None),
-            task_type="unknown",
-            code="INVALID_TASK",
-            message=str(exc),
-            duration_ms=0,
-        )
-        _print_result(result)
+        _print_result(_invalid_input(str(exc)))
         return EXIT_INVALID_INPUT
 
     if args.command == "evaluate":
         return _handle_evaluate(args)
 
-    if args.command == "run":
-        payload, error_result = _load_task_file(args.task_file)
-        if error_result is not None:
-            _print_result(error_result)
-            return EXIT_INVALID_INPUT
-    else:
-        payload = {
-            "version": "v1",
-            "type": "find_job_page",
-            "payload": {
-                "company_url": args.company_url,
-                "max_steps": args.max_steps,
-            },
-        }
-
     try:
-        config = _runtime_config(args)
+        settings = settings_from_config(_runtime_config(args))
     except ValidationError as exc:
-        result = build_failed_result(
-            task_id=resolve_task_id(None),
-            task_type="unknown",
-            code="INVALID_TASK",
-            message=f"Invalid runtime configuration: {exc.errors()[0]['msg']}",
-            duration_ms=0,
-        )
+        result = _invalid_input(f"Invalid runtime configuration: {exc.errors()[0]['msg']}")
         _print_result(result)
         return EXIT_INVALID_INPUT
-    result = asyncio.run(run_task(payload, config=config))
-    _print_result(result)
-    return _exit_code(result)
+
+    return asyncio.run(_run_payloads(_jsonl_payloads(args.input_path), settings))
 
 
 def run() -> None:

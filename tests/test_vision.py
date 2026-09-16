@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 from PIL import Image
 
-from job_page_finder.scrolling import ScrollTarget
-from job_page_finder.vision import build_visual_context
+from job_page_finder.adapters.browser_use.scroll_targets import ScrollTarget
+from job_page_finder.adapters.browser_use.vision import build_visual_context
 
 
 class FakeNode:

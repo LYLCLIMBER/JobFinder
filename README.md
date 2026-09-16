@@ -2,6 +2,8 @@
 
 一个基于本地 `browser-use` 的轻量招聘岗位页面发现器。输入企业官网 URL，最多执行有限次点击、滚动或等待，直到当前页面出现具体岗位名称。
 
+当前实现行为、稳定边界、已知限制和项目级验收场景见 [`docs/current-behavior.md`](docs/current-behavior.md)；逐测试风险保障见 [`docs/test-protection-map.md`](docs/test-protection-map.md)。
+
 ## 安装
 
 ```bash
@@ -47,11 +49,10 @@ asyncio.run(main())
 ```
 
 ```bash
-jobfinder find-job-page https://example.com --max-steps 8
-jobfinder run task.json
+jobfinder run task.jsonl
 ```
 
-`jobfinder` 成功时退出码为 0；非法输入为 2；配置错误为 3；任务执行失败为 1。标准输出只包含最终 JSON，诊断日志写入标准错误。
+`run` 读取 JSONL（每个非空行一个 TaskRequest），立即输出一行 TaskResult。成功退出码为 0，非法输入或非法 CLI 运行参数为 2，LLM、环境或运行依赖装配错误为 3，任务执行失败为 1。多行时总退出码优先级为 3 > 2 > 1 > 0。评估命令本身正常完成时返回 0；被归一化为 `EvaluationError` 或配置校验错误的失败返回 2。评估中的单个 Finder 失败记录在结果和汇总中，不改变评估命令退出码。标准输出只包含 JSONL 结果，诊断日志写入标准错误。
 
 ## 批量运行评估
 
@@ -98,12 +99,12 @@ jobfinder evaluate summarize \
 
 ### 运行时诊断
 
-每个 `run_task()` 运行默认在 `log/diagnostics/` 创建一个独立的 `basic` 诊断目录，包含
-`events.jsonl`、`manifest.json` 和最终 `result` 产物；业务 JSON schema 不会变化。可用 CLI 控制：
+每个 `run_task()` 运行默认在 `log/diagnostics/` 创建一个独立的 `basic` 诊断目录。正常完成路径会尝试写入
+`events.jsonl`、`manifest.json` 和最终 `result` 产物；取消路径不写 result，所有诊断写入均为 best-effort。业务 JSON schema 不会变化。可用 CLI 控制：
 
 ```bash
-jobfinder find-job-page https://example.com --diagnostics-level diagnostic
-jobfinder run task.json --diagnostics-level raw --diagnostics-root /controlled/diagnostics \
+jobfinder run task.jsonl --diagnostics-level diagnostic
+jobfinder run task.jsonl --diagnostics-level raw --diagnostics-root /controlled/diagnostics \
   --diagnostics-screenshots --diagnostics-max-runs 100 --diagnostics-retention-days 7 \
   --diagnostics-max-run-bytes 268435456 --diagnostics-max-total-bytes 5368709120
 ```
@@ -125,38 +126,10 @@ manifest/events 也会记录该故障。
 SDK 只能保存实际可取得的完成响应；不会采集不可得的原始 SDK 数据或隐藏推理（thinking）。运行目录
 和产物分别以 0700、0600 权限创建，并以原子替换写入产物。
 
-也可以继续直接调用领域执行器：
-
-```python
-import asyncio
-
-from job_page_finder import (
-    JobPageFinder,
-    JobPageFinderInput,
-    create_deepseek_llm,
-)
-
-
-async def main() -> None:
-    finder = JobPageFinder(llm=create_deepseek_llm())
-    result = await finder.find(
-        JobPageFinderInput(company_url="https://example.com", max_steps=8)
-    )
-    print(result.model_dump_json(indent=2))
-
-
-asyncio.run(main())
-```
+包根稳定 API 为 `run_task`、`TaskRequest`、`TaskResult`、`RuntimeSettings` 和 `DiagnosticsSettings`。`JobPageFinder` 可从子模块使用，不属于包根兼容承诺。
 
 默认浏览器配置为无头模式，关闭下载和默认扩展，并在所有退出路径终止浏览器进程。页面状态截图按视觉和诊断配置获取。MVP 不处理登录、验证码、申请表单或搜索引擎查找官网。
 
-条件视觉默认开启，需要使用支持图片输入的模型；可通过 `RuntimeConfig(use_vision=False)` 或 `JobPageFinder(use_vision=False)` 显式关闭。以下示例显式指定视觉配置：
-
-```python
-finder = JobPageFinder(
-    llm=create_deepseek_llm(model="deepseek-v4-flash-vision-exp"),
-    use_vision=True,
-)
-```
+条件视觉默认开启，需要使用支持图片输入的模型；可通过 `RuntimeSettings(finder=FinderSettings(use_vision=False))` 显式关闭。
 
 只有页面存在没有文本语义但有可靠布局位置的交互元素时，当前视口截图才会附加到模型请求中。实现说明见 [`agent-docs/tasks/JF-002-conditional-vision-fallback/spec.md`](agent-docs/tasks/JF-002-conditional-vision-fallback/spec.md)。

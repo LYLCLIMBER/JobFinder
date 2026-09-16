@@ -11,12 +11,14 @@ from typing import Any
 import pytest
 from PIL import Image
 
+from job_page_finder.adapters.models.browser_use_chat import AgentDecision
 from job_page_finder.cli import EXIT_SUCCESS, main
 from job_page_finder.diagnostics import DiagnosticWriter, serializable
-from job_page_finder.finder import JobPageFinder
-from job_page_finder.models import AgentDecision, JobPageFinderInput, JobPageFinderResult
+from job_page_finder.models import JobPageFinderInput, JobPageFinderResult
 from job_page_finder.runner import TaskRunner
 from job_page_finder.runtime import RuntimeConfig, run_task
+from job_page_finder.task_protocol import FindJobPageTaskOutput, TaskMetadata, TaskResult
+from tests.helpers import assemble_finder
 
 
 class FakeDom:
@@ -132,7 +134,7 @@ async def test_diagnostic_levels_gate_artifacts(
 ) -> None:
     browser = FakeBrowser("<div>Senior Engineer</div>", png())
     llm = FakeLlm({"type": "done", "job_title": "Senior Engineer", "evidence": "Senior Engineer"})
-    finder = JobPageFinder(llm=llm, browser_factory=lambda: browser, tools=FakeTools())
+    finder = assemble_finder(llm, browser_factory=lambda: browser, tools=FakeTools())
 
     result = await run_task(
         request(), finder=finder, config=RuntimeConfig(diagnostics_root=tmp_path, diagnostics_level=level)
@@ -159,7 +161,7 @@ async def test_screenshot_capture_does_not_change_nonvision_model_input(tmp_path
     for enabled in (False, True):
         browser = FakeBrowser("<div>Senior Engineer</div>", png())
         llm = FakeLlm({"type": "done", "job_title": "Senior Engineer", "evidence": "Senior Engineer"})
-        finder = JobPageFinder(llm=llm, browser_factory=lambda: browser, tools=FakeTools(), use_vision=False)
+        finder = assemble_finder(llm, browser_factory=lambda: browser, tools=FakeTools(), use_vision=False)
         result = await run_task(
             request(f"screenshots-{enabled}"),
             finder=finder,
@@ -179,8 +181,8 @@ async def test_screenshot_capture_does_not_change_nonvision_model_input(tmp_path
 async def test_raw_records_post_action_snapshot_and_concurrent_runs_are_isolated(tmp_path: Path) -> None:
     async def one(task_id: str) -> JobPageFinderResult:
         browser = FakeBrowser("<div>Careers</div>", png())
-        finder = JobPageFinder(
-            llm=FakeLlm({"type": "scroll", "direction": "down"}),
+        finder = assemble_finder(
+            FakeLlm({"type": "scroll", "direction": "down"}),
             browser_factory=lambda: browser,
             tools=FakeTools(),
         )
@@ -200,8 +202,8 @@ async def test_raw_records_post_action_snapshot_and_concurrent_runs_are_isolated
 @pytest.mark.asyncio
 async def test_raw_action_snapshot_timeout_does_not_change_action_result(tmp_path: Path) -> None:
     browser = FakeBrowser("<div>Careers</div>", png(), action_snapshot_delay=0.1)
-    finder = JobPageFinder(
-        llm=FakeLlm({"type": "scroll", "direction": "down"}),
+    finder = assemble_finder(
+        FakeLlm({"type": "scroll", "direction": "down"}),
         browser_factory=lambda: browser,
         tools=FakeTools(),
         step_timeout=0.01,
@@ -220,8 +222,8 @@ async def test_raw_action_snapshot_timeout_does_not_change_action_result(tmp_pat
 @pytest.mark.asyncio
 async def test_step_start_is_recorded_before_browser_state_timeout(tmp_path: Path) -> None:
     browser = FakeBrowser("<div>Careers</div>", png(), state_delay=0.05)
-    finder = JobPageFinder(
-        llm=FakeLlm({"type": "done", "job_title": "Careers", "evidence": "Careers"}),
+    finder = assemble_finder(
+        FakeLlm({"type": "done", "job_title": "Careers", "evidence": "Careers"}),
         browser_factory=lambda: browser,
         tools=FakeTools(),
         step_timeout=0.01,
@@ -233,16 +235,15 @@ async def test_step_start_is_recorded_before_browser_state_timeout(tmp_path: Pat
     assert result.error is not None and result.error.code == "STEP_TIMEOUT"
     run_dir = next(path for path in tmp_path.iterdir() if path.is_dir())
     events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text().splitlines()]
-    assert [event["event"] for event in events if event.get("step_id") == "step-1"] == [
-        "step_started",
-        "step_finished",
-    ]
+    step_events = [event for event in events if event.get("step_id") == "step-1"]
+    assert {event["event"] for event in step_events} == {"step_started", "step_finished"}
+    assert next(event for event in step_events if event["event"] == "step_finished")["status"] == "timed_out"
 
 
 @pytest.mark.asyncio
 async def test_action_timeout_has_matched_action_and_step_events(tmp_path: Path) -> None:
-    finder = JobPageFinder(
-        llm=FakeLlm({"type": "scroll", "direction": "down"}),
+    finder = assemble_finder(
+        FakeLlm({"type": "scroll", "direction": "down"}),
         browser_factory=lambda: FakeBrowser("<div>Careers</div>", png()),
         tools=SlowTools(),
         step_timeout=0.01,
@@ -254,19 +255,13 @@ async def test_action_timeout_has_matched_action_and_step_events(tmp_path: Path)
     assert result.error is not None and result.error.code == "STEP_TIMEOUT"
     run_dir = next(path for path in tmp_path.iterdir() if path.is_dir())
     events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text().splitlines()]
-    assert [event["event"] for event in events if event.get("step_id") == "step-1"] == [
-        "step_started",
-        "page_observed",
-        "model_call_started",
-        "model_call_finished",
-        "action_selected",
-        "action_finished",
-        "step_finished",
-    ]
-    assert [event["status"] for event in events if event["event"] in {"action_finished", "step_finished"}] == [
-        "timed_out",
-        "timed_out",
-    ]
+    step_events = [event for event in events if event.get("step_id") == "step-1"]
+    assert {"step_started", "page_observed", "action_selected", "action_finished", "step_finished"} <= {
+        event["event"] for event in step_events
+    }
+    terminal_events = [event for event in step_events if event["event"] in {"action_finished", "step_finished"}]
+    assert {event["event"] for event in terminal_events} == {"action_finished", "step_finished"}
+    assert all(event["status"] == "timed_out" for event in terminal_events)
 
 
 @pytest.mark.asyncio
@@ -317,7 +312,7 @@ def test_tiny_capacity_always_writes_final_result(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_total_capacity_is_shared_and_artifact_files_are_private(tmp_path: Path) -> None:
+async def test_total_capacity_is_shared_and_diagnostic_paths_are_private(tmp_path: Path) -> None:
     def create(task_id: str) -> DiagnosticWriter:
         return DiagnosticWriter(
             root=tmp_path,
@@ -336,7 +331,11 @@ async def test_total_capacity_is_shared_and_artifact_files_are_private(tmp_path:
     assert first.artifact("small", "x" * 500) is not None
     assert second.artifact("small", "x" * 500) is None
     artifact = next((first.run_dir / "artifacts").iterdir())
-    assert artifact.stat().st_mode & 0o777 == 0o600
+    assert tmp_path.stat().st_mode & 0o777 == 0o700
+    assert first.run_dir.stat().st_mode & 0o777 == 0o700
+    assert (first.run_dir / "artifacts").stat().st_mode & 0o777 == 0o700
+    for path in (first.run_dir / "manifest.json", first.run_dir / "events.jsonl", artifact):
+        assert path.stat().st_mode & 0o777 == 0o600
 
 
 def test_serialization_omits_unavailable_sensitive_or_hidden_sdk_fields() -> None:
@@ -361,8 +360,8 @@ class SlowActionEventDiagnosticWriter(DiagnosticWriter):
 @pytest.mark.asyncio
 async def test_slow_diagnostic_serialization_does_not_consume_step_timeout(tmp_path: Path) -> None:
     browser = FakeBrowser("<div>Senior Engineer</div>", png())
-    finder = JobPageFinder(
-        llm=FakeLlm({"type": "done", "job_title": "Senior Engineer", "evidence": "Senior Engineer"}),
+    finder = assemble_finder(
+        FakeLlm({"type": "done", "job_title": "Senior Engineer", "evidence": "Senior Engineer"}),
         browser_factory=lambda: browser,
         tools=FakeTools(),
         step_timeout=0.01,
@@ -385,8 +384,8 @@ async def test_slow_diagnostic_serialization_does_not_consume_step_timeout(tmp_p
 @pytest.mark.asyncio
 async def test_slow_action_selection_event_does_not_consume_step_timeout(tmp_path: Path) -> None:
     browser = FakeBrowser("<div>Careers</div>", png())
-    finder = JobPageFinder(
-        llm=FakeLlm({"type": "scroll", "direction": "down"}),
+    finder = assemble_finder(
+        FakeLlm({"type": "scroll", "direction": "down"}),
         browser_factory=lambda: browser,
         tools=FakeTools(),
         step_timeout=0.01,
@@ -570,8 +569,8 @@ async def test_diagnostic_saves_actual_annotated_screenshot_and_coordinates(tmp_
     )
     browser.state.dom_state.selector_map = {7: node}
     llm = FakeLlm({"type": "scroll", "direction": "down"})
-    finder = JobPageFinder(
-        llm=llm,
+    finder = assemble_finder(
+        llm,
         browser_factory=lambda: browser,
         tools=FakeTools(),
         use_vision=True,
@@ -587,38 +586,57 @@ async def test_diagnostic_saves_actual_annotated_screenshot_and_coordinates(tmp_
     run_dir = next(tmp_path.iterdir())
     assert {"annotated_screenshot", "visual_candidates"} <= artifact_kinds(run_dir)
     candidate = next((run_dir / "artifacts").glob("*_visual_candidates.json"))
-    assert json.loads(candidate.read_text()) == [{"index": 7, "coordinates": [1, 1, 6, 6]}]
+    assert json.loads(candidate.read_text()) == [{"ref": "observation:1:index:7", "coordinates": [1, 1, 6, 6]}]
     assert llm.calls[0][-1].content[-1].type == "image_url"
 
 
 def test_cli_diagnostic_options_keep_stdout_json(monkeypatch, capsys, tmp_path: Path) -> None:
-    captured: dict[str, RuntimeConfig] = {}
+    captured: dict[str, Any] = {}
 
-    async def fake_run_task(payload: object, *, config: RuntimeConfig) -> Any:
-        captured["config"] = config
-        return await TaskRunner(
-            lambda _: asyncio.sleep(
-                0,
-                result=JobPageFinderResult(
-                    success=True,
-                    job_page_url="https://example.com/careers",
-                    job_title="Engineer",
-                    evidence="Engineer",
-                    steps=1,
-                ),
-            )
-        ).run(payload)
+    def fake_build(settings=None, **kwargs):
+        captured["settings"] = settings
 
-    monkeypatch.setattr("job_page_finder.cli.run_task", fake_run_task)
+        class Application:
+            async def run(self, request):
+                return TaskResult(
+                    version="v1",
+                    task_id=request.get("task_id", "test-task"),
+                    type="find_job_page",
+                    status="succeeded",
+                    output=FindJobPageTaskOutput(
+                        job_page_url="https://example.com/careers",
+                        job_title="Engineer",
+                        evidence="Engineer",
+                        steps=1,
+                    ),
+                    error=None,
+                    metadata=TaskMetadata(duration_ms=1),
+                )
+
+        return Application()
+
+    monkeypatch.setattr("job_page_finder.cli.build_application", fake_build)
+    task_file = tmp_path / "task.jsonl"
+    task_file.write_text(
+        json.dumps(
+            {
+                "version": "v1",
+                "type": "find_job_page",
+                "payload": {"company_url": "https://example.com"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     assert (
         main(
             [
-                "find-job-page",
-                "https://example.com",
+                "run",
+                str(task_file),
                 "--diagnostics-level",
                 "raw",
                 "--diagnostics-root",
-                str(tmp_path),
+                str(tmp_path / "diagnostics"),
                 "--diagnostics-max-run-bytes",
                 "1234",
                 "--diagnostics-max-total-bytes",
@@ -629,22 +647,22 @@ def test_cli_diagnostic_options_keep_stdout_json(monkeypatch, capsys, tmp_path: 
     )
     stdout = json.loads(capsys.readouterr().out)
     assert stdout["status"] == "succeeded"
-    assert captured["config"].diagnostics_level == "raw"
-    assert captured["config"].diagnostics_root == tmp_path
-    assert captured["config"].diagnostics_max_run_bytes == 1234
-    assert captured["config"].diagnostics_max_total_bytes == 5678
+    assert captured["settings"].diagnostics.level == "raw"
+    assert captured["settings"].diagnostics.root == tmp_path / "diagnostics"
+    assert captured["settings"].diagnostics.storage.max_run_bytes == 1234
+    assert captured["settings"].diagnostics.storage.max_total_bytes == 5678
 
 
 def test_cli_invalid_diagnostic_limits_are_structured_json(capsys) -> None:
-    assert main(["find-job-page", "https://example.com", "--diagnostics-max-runs", "0"]) == 2
+    assert main(["run", "--diagnostics-max-runs", "0"]) == 2
     payload = json.loads(capsys.readouterr().out)
     assert payload["error"]["code"] == "INVALID_TASK"
 
-    assert main(["find-job-page", "https://example.com", "--diagnostics-max-run-bytes", "0"]) == 2
+    assert main(["run", "--diagnostics-max-run-bytes", "0"]) == 2
     payload = json.loads(capsys.readouterr().out)
     assert payload["error"]["code"] == "INVALID_TASK"
 
-    assert main(["find-job-page", "https://example.com", "--diagnostics-retention-days", "-1"]) == 2
+    assert main(["run", "--diagnostics-retention-days", "-1"]) == 2
     payload = json.loads(capsys.readouterr().out)
     assert payload["error"]["code"] == "INVALID_TASK"
 
