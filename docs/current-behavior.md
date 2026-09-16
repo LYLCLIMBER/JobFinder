@@ -4,7 +4,7 @@
 
 本文档记录从 JobFinder 当前实现、测试和既有验收事实中归纳出的系统行为与稳定边界，是精简测试、修改实现和评审回归影响时的现状基线；它不等同于面向未来的产品规格。
 
-事实来源按优先级为实际代码、已完成任务的交接与验证记录、任务规格和 README。本文档描述当前 `v1` 行为，不把尚未实现的提案写成现有能力。具体功能的设计历史和验收证据仍保留在 [`agent-docs/`](../agent-docs/README.md) 中。
+事实来源按优先级为实际代码、测试和 README。本文档描述当前 `v1` 行为，不把尚未实现的提案写成现有能力；模块职责、依赖方向和兼容决策见 [`architecture.md`](architecture.md)。
 
 ## 当前能力概述
 
@@ -28,8 +28,7 @@ JobFinder 接收企业官网 HTTP(S) URL，在有限步骤和受限浏览器动�
 - 主动提交申请、填写表单、登录、处理验证码、上传或下载文件；当前没有这些专用动作。
 - 向模型开放任意 URL 导航、任意 JavaScript、键盘输入或通用浏览器控制。
 - 提供 HTTP API、任务队列、后台 worker、数据库任务历史或管理 UI。
-- 提供基于人工真值的准确率、召回率或成功率评估。
-- 修改或封装相邻的 `../browser-use` 源码。
+- 修改或封装 `browser-use` 源码。
 
 ## 系统边界
 
@@ -47,7 +46,10 @@ JobPageFinder 浏览器循环
         |
         +--> browser-use / Chromium
         +--> DeepSeek 或兼容结构化输出模型
-        +--> 本地诊断目录
+
+TaskApplication / JobPageFinder
+        |
+        +--> Diagnostics Ports --> 本地诊断 adapter
 ```
 
 当前仅支持任务版本 `v1` 和任务类型 `find_job_page`。
@@ -58,7 +60,7 @@ JobPageFinder 浏览器循环
 - **招聘岗位页面**：当前可访问页面的可见 DOM 中至少包含一个具体岗位名称的页面。
 - **具体岗位名称**：例如“Senior Backend Engineer”。产品意图不把 `Careers`、`Jobs`、`招聘`、`加入我们`、`查看职位` 等通用入口视为具体岗位；当前主要由模型提示约束这一点，程序没有通用标题黑名单。
 - **步骤**：获取当前状态、让模型选择一个动作并处理该动作的一轮执行。
-- **当前浏览器状态**：本步骤取得的 URL、标题、DOM、selector map、页面滚动信息及按配置获取的截图。
+- **当前浏览器状态**：本步骤取得的 URL、标题、可见 DOM 文本、不透明元素引用、页面滚动信息及按配置获取的截图。
 - **诊断**：独立于业务结果的本地运行事件和产物；诊断故障不得改变业务结果。
 
 ## 功能需求
@@ -119,7 +121,7 @@ JobPageFinder 浏览器循环
 
 ### 条件视觉
 
-- `FR-050`：视觉默认开启，可通过 `RuntimeConfig(use_vision=False)` 或 `JobPageFinder(use_vision=False)` 显式关闭。
+- `FR-050`：视觉默认开启，可通过 `RuntimeSettings.finder.use_vision=False` 显式关闭；内部兼容入口仍可把 `RuntimeConfig(use_vision=False)` 映射到该设置。
 - `FR-051`：视觉开启时可以获取当前视口截图，但只有存在可靠候选时才把标注截图加入模型请求。
 - `FR-052`：普通视觉候选来自 selector map 中可见、有可靠布局位置但缺少文本、语义属性、可访问名称和已检查后代图片标签的元素。
 - `FR-053`：当前可滚动目标即使有文本，也可作为视觉标注候选。
@@ -132,19 +134,20 @@ JobPageFinder 浏览器循环
 
 ### 领域结果
 
-直接调用 `JobPageFinder.find()` 返回 `JobPageFinderResult`：
+直接调用 `JobPageFinder.find()` 返回 `FindJobPageSuccess | FindJobPageFailure` 判别联合：
 
 | 字段 | 类型 | 约束 |
 | --- | --- | --- |
-| `success` | boolean | 表示 Finder 是否接受一个 `done` 结果 |
-| `job_page_url` | string 或 null | 成功时必须非空，并取自完成时的当前 URL |
-| `job_title` | string 或 null | 成功时必须非空 |
-| `evidence` | string 或 null | 成功时必须非空，但当前不保证完整文本出现在 DOM |
-| `steps` | integer | 已执行或尝试的步骤数 |
-| `error` | string 或 null | 失败时的人类可读说明 |
-| `error_code` | FinderErrorCode 或 null | 失败时的机器可读分类 |
+| `status` | `succeeded` 或 `failed` | 判别成功和失败分支 |
+| `job_page_url` | HTTP(S) URL | 仅成功分支存在，取自完成时的当前 URL |
+| `job_title` | string | 仅成功分支存在且非空 |
+| `evidence` | `JobEvidence` | 仅成功分支存在；包含非空 quote 和来源 URL |
+| `code` | FinderFailureCode | 仅失败分支存在 |
+| `message` | string | 仅失败分支存在的人类可读说明 |
+| `retryable` | boolean | 仅失败分支存在 |
+| `steps` | integer | 两个分支都记录已执行或尝试的步骤数 |
 
-成功领域结果必须同时具有 `job_page_url`、`job_title` 和 `evidence`。领域错误码范围为 `BROWSER_INITIALIZATION_FAILED`、`BROWSER_INITIALIZATION_TIMEOUT`、`STEP_TIMEOUT`、`MODEL_ERROR`、`ACTION_ERROR`、`VALIDATION_FAILED` 和 `MAX_STEPS_REACHED`。`TaskApplication` 将这些字段映射到统一任务结果；请求、配置和未预期异常产生的顶层错误码只存在于任务运行契约中。
+判别联合不能表达“成功但缺少岗位字段”的状态。领域错误码范围为 `BROWSER_INITIALIZATION_FAILED`、`BROWSER_INITIALIZATION_TIMEOUT`、`STEP_TIMEOUT`、`MODEL_ERROR`、`ACTION_ERROR`、`VALIDATION_FAILED` 和 `MAX_STEPS_REACHED`。`TaskApplication` 将领域结果映射到统一任务结果；请求、配置和未预期异常产生的顶层错误码只存在于任务运行契约中。
 
 ### 请求
 
@@ -313,7 +316,7 @@ jobfinder evaluate summarize ...
 - `AC-007`：根滚轮不改变偏移但触发延迟 SPA URL 变化时，动作被识别为成功且不执行内部 fallback。
 - `AC-008`：视觉候选存在时模型收到带当前索引的标注截图；候选不存在或视觉关闭时使用纯文本输入。
 - `AC-009`：非法任务在依赖装配和浏览器启动前返回结构化错误。
-- `AC-010`：Python API、CLI 快捷命令和 JSON 文件入口遵守同一结果及错误码契约。
+- `AC-010`：Python API、CLI JSONL 文件和 stdin 入口遵守同一结果及错误码契约。
 - `AC-011`：浏览器启动失败、步骤超时、模型失败、动作失败、校验失败和预算耗尽映射为稳定错误码。
 - `AC-012`：所有正常和异常退出路径尝试关闭浏览器，清理失败不覆盖主结果。
 - `AC-013`：三级诊断遵守各自产物边界，截图采集不改变非视觉模型输入。
@@ -356,24 +359,26 @@ jobfinder evaluate summarize ...
 
 - `job_page_finder.runtime.create_runner()` / `RuntimeConfig`：测试与旧组合参数的内部桥接，生产入口使用 `build_application()` 和 `RuntimeSettings`。
 - `job_page_finder.runner.TaskRunner`：薄委托，生产生命周期由 `TaskApplication` 拥有。
-- `job_page_finder.models.JobPageFinderInput` / `JobPageFinderResult`：Finder 内部契约；Task v1 通过显式 mapper 隔离。
+- `job_page_finder.models.JobPageFinderInput` / `JobPageFinderResult`：仅供 `TaskRunner` 子模块兼容旧 callable executor，不是 Finder 核心契约。
 - `job_page_finder.diagnostics.DiagnosticWriter`：文件诊断 adapter 实现细节。
 
 ## 代码映射
 
 | 领域 | 主要代码 |
 | --- | --- |
-| 输入、动作、领域结果 | `src/job_page_finder/models.py` |
-| 浏览器循环和完成校验 | `src/job_page_finder/finder.py` |
-| 内部滚动目标 | `src/job_page_finder/scrolling.py` |
-| 条件视觉 | `src/job_page_finder/vision.py` |
+| Finder 输入与领域结果 | `src/job_page_finder/contracts.py` |
+| 页面观察与动作 | `src/job_page_finder/core_models.py` |
+| 外部能力接口 | `src/job_page_finder/ports.py` |
+| 浏览器循环与完成校验 | `src/job_page_finder/finder.py`、`completion.py` |
+| Browser Adapter、滚动与视觉 | `src/job_page_finder/adapters/browser_use/` |
+| Model Adapter | `src/job_page_finder/adapters/models/browser_use_chat.py` |
 | Task v1 协议 | `src/job_page_finder/task_protocol.py` |
 | 任务生命周期 | `src/job_page_finder/application.py` |
 | 组合根 | `src/job_page_finder/runtime.py` |
 | 公共 Python API | `src/job_page_finder/api.py` |
 | 环境和 LLM | `src/job_page_finder/config.py` |
 | CLI | `src/job_page_finder/cli.py` |
-| 诊断 | `src/job_page_finder/diagnostics.py` |
+| 诊断 | `src/job_page_finder/adapters/diagnostics.py`、`diagnostics.py` |
 | 运行评估 | `src/job_page_finder/evaluation/` |
 
 ## 外部依赖

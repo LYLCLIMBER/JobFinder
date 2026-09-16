@@ -2,7 +2,7 @@
 
 一个基于本地 `browser-use` 的轻量招聘岗位页面发现器。输入企业官网 URL，最多执行有限次点击、滚动或等待，直到当前页面出现具体岗位名称。
 
-当前实现行为、稳定边界、已知限制和项目级验收场景见 [`docs/current-behavior.md`](docs/current-behavior.md)；逐测试风险保障见 [`docs/test-protection-map.md`](docs/test-protection-map.md)。
+当前实现行为、稳定边界、已知限制和项目级验收场景见 [`docs/current-behavior.md`](docs/current-behavior.md)；模块职责和依赖方向见 [`docs/architecture.md`](docs/architecture.md)。
 
 ## 安装
 
@@ -49,10 +49,50 @@ asyncio.run(main())
 ```
 
 ```bash
-jobfinder run task.jsonl
+uv run jobfinder run task.jsonl
+```
+
+`task.jsonl` 中每个非空物理行是一个完整的 Task v1 JSON 对象，例如：
+
+```jsonl
+{"version":"v1","task_id":"example-run","type":"find_job_page","payload":{"company_url":"https://example.com","max_steps":8}}
+```
+
+也可以从 stdin 运行。Fish 示例：
+
+```fish
+echo '{"version":"v1","type":"find_job_page","payload":{"company_url":"https://example.com","max_steps":8}}' | uv run jobfinder run -
 ```
 
 `run` 读取 JSONL（每个非空行一个 TaskRequest），立即输出一行 TaskResult。成功退出码为 0，非法输入或非法 CLI 运行参数为 2，LLM、环境或运行依赖装配错误为 3，任务执行失败为 1。多行时总退出码优先级为 3 > 2 > 1 > 0。评估命令本身正常完成时返回 0；被归一化为 `EvaluationError` 或配置校验错误的失败返回 2。评估中的单个 Finder 失败记录在结果和汇总中，不改变评估命令退出码。标准输出只包含 JSONL 结果，诊断日志写入标准错误。
+
+Python 调用者可以通过稳定设置模型关闭视觉或调整诊断：
+
+```python
+import asyncio
+
+from job_page_finder import DiagnosticsSettings, RuntimeSettings, run_task
+from job_page_finder.settings import FinderSettings
+
+
+async def main() -> None:
+    settings = RuntimeSettings(
+        finder=FinderSettings(use_vision=False),
+        diagnostics=DiagnosticsSettings(level="diagnostic", capture_screenshots=False),
+    )
+    result = await run_task(
+        {
+            "version": "v1",
+            "type": "find_job_page",
+            "payload": {"company_url": "https://example.com", "max_steps": 8},
+        },
+        settings=settings,
+    )
+    print(result.model_dump_json(indent=2))
+
+
+asyncio.run(main())
+```
 
 ## 批量运行评估
 
@@ -63,7 +103,7 @@ URL、来源和抽样桶；证券市场字段只用于生成阶段的分层，�
 生成默认 120 条样本：
 
 ```bash
-jobfinder evaluate generate \
+uv run jobfinder evaluate generate \
   --db ../CorpWeb/data/companies.sqlite3 \
   --output evaluation/corpweb-pilot-v1/cases.jsonl
 ```
@@ -71,7 +111,7 @@ jobfinder evaluate generate \
 以最多两个并发浏览器执行，并在每条完成后立即追加结果：
 
 ```bash
-jobfinder evaluate run \
+uv run jobfinder evaluate run \
   --dataset evaluation/corpweb-pilot-v1/cases.jsonl \
   --run-id baseline
 ```
@@ -87,7 +127,7 @@ sidecar 放在同一目录；默认诊断级别为 `diagnostic`，诊断写入�
 生成机器可读和 Markdown 汇总：
 
 ```bash
-jobfinder evaluate summarize \
+uv run jobfinder evaluate summarize \
   --dataset evaluation/corpweb-pilot-v1/cases.jsonl \
   --results evaluation/corpweb-pilot-v1/runs/baseline/results.jsonl \
   --json-output evaluation/corpweb-pilot-v1/summary.json \
@@ -103,8 +143,8 @@ jobfinder evaluate summarize \
 `events.jsonl`、`manifest.json` 和最终 `result` 产物；取消路径不写 result，所有诊断写入均为 best-effort。业务 JSON schema 不会变化。可用 CLI 控制：
 
 ```bash
-jobfinder run task.jsonl --diagnostics-level diagnostic
-jobfinder run task.jsonl --diagnostics-level raw --diagnostics-root /controlled/diagnostics \
+uv run jobfinder run task.jsonl --diagnostics-level diagnostic
+uv run jobfinder run task.jsonl --diagnostics-level raw --diagnostics-root /controlled/diagnostics \
   --diagnostics-screenshots --diagnostics-max-runs 100 --diagnostics-retention-days 7 \
   --diagnostics-max-run-bytes 268435456 --diagnostics-max-total-bytes 5368709120
 ```
@@ -132,4 +172,4 @@ SDK 只能保存实际可取得的完成响应；不会采集不可得的原始 
 
 条件视觉默认开启，需要使用支持图片输入的模型；可通过 `RuntimeSettings(finder=FinderSettings(use_vision=False))` 显式关闭。
 
-只有页面存在没有文本语义但有可靠布局位置的交互元素时，当前视口截图才会附加到模型请求中。实现说明见 [`agent-docs/tasks/JF-002-conditional-vision-fallback/spec.md`](agent-docs/tasks/JF-002-conditional-vision-fallback/spec.md)。
+只有页面存在可靠视觉候选时，当前视口截图才会附加到模型请求中；候选包括没有文本语义但有可靠布局位置的交互元素，以及当前观察中的滚动目标。实现边界见 [`docs/architecture.md`](docs/architecture.md) 的 Browser Adapter 与 Model Adapter 章节。
